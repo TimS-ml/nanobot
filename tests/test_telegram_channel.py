@@ -1,3 +1,6 @@
+# Tests for the Telegram channel: proxy configuration, topic/thread routing,
+# file extension detection, sender allow-list validation, and reply threading.
+
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +11,7 @@ from nanobot.channels.telegram import TelegramChannel
 from nanobot.config.schema import TelegramConfig
 
 
+# Fake HTTPX request that records construction kwargs for proxy assertion
 class _FakeHTTPXRequest:
     instances: list["_FakeHTTPXRequest"] = []
 
@@ -87,6 +91,7 @@ class _FakeBuilder:
         return self.app
 
 
+# Verify proxy is configured via HTTPXRequest, not via deprecated builder.proxy()
 @pytest.mark.asyncio
 async def test_start_uses_request_proxy_without_builder_proxy(monkeypatch) -> None:
     config = TelegramConfig(
@@ -114,6 +119,7 @@ async def test_start_uses_request_proxy_without_builder_proxy(monkeypatch) -> No
     assert builder.get_updates_request_value is _FakeHTTPXRequest.instances[0]
 
 
+# Verify supergroup topic messages derive session key from thread_id
 def test_derive_topic_session_key_uses_thread_id() -> None:
     message = SimpleNamespace(
         chat=SimpleNamespace(type="supergroup"),
@@ -124,6 +130,7 @@ def test_derive_topic_session_key_uses_thread_id() -> None:
     assert TelegramChannel._derive_topic_session_key(message) == "telegram:-100123:topic:42"
 
 
+# Verify file extension is extracted from original filename when MIME type is missing
 def test_get_extension_falls_back_to_original_filename() -> None:
     channel = TelegramChannel(TelegramConfig(), MessageBus())
 
@@ -131,6 +138,7 @@ def test_get_extension_falls_back_to_original_filename() -> None:
     assert channel._get_extension("file", None, "archive.tar.gz") == ".tar.gz"
 
 
+# Verify allow_from matches by numeric ID or username in "id|username" format
 def test_is_allowed_accepts_legacy_telegram_id_username_formats() -> None:
     channel = TelegramChannel(TelegramConfig(allow_from=["12345", "alice", "67890|bob"]), MessageBus())
 
@@ -139,6 +147,7 @@ def test_is_allowed_accepts_legacy_telegram_id_username_formats() -> None:
     assert channel.is_allowed("67890|bob") is True
 
 
+# Verify malformed sender IDs (extra pipes, non-numeric IDs) are rejected
 def test_is_allowed_rejects_invalid_legacy_telegram_sender_shapes() -> None:
     channel = TelegramChannel(TelegramConfig(allow_from=["alice"]), MessageBus())
 
@@ -146,6 +155,7 @@ def test_is_allowed_rejects_invalid_legacy_telegram_sender_shapes() -> None:
     assert channel.is_allowed("not-a-number|alice") is False
 
 
+# Verify progress messages include message_thread_id to stay in the correct topic
 @pytest.mark.asyncio
 async def test_send_progress_keeps_message_in_topic() -> None:
     config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"])
@@ -164,6 +174,7 @@ async def test_send_progress_keeps_message_in_topic() -> None:
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
 
 
+# Verify reply messages infer the topic thread ID from the message-to-thread cache
 @pytest.mark.asyncio
 async def test_send_reply_infers_topic_from_message_id_cache() -> None:
     config = TelegramConfig(enabled=True, token="123:abc", allow_from=["*"], reply_to_message=True)

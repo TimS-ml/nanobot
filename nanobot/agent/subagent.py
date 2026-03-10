@@ -47,6 +47,7 @@ class SubagentManager:
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        # Track running subagent tasks for status queries and cancellation
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -59,10 +60,13 @@ class SubagentManager:
         session_key: str | None = None,
     ) -> str:
         """Spawn a subagent to execute a task in the background."""
+        # Generate a short unique ID for tracking and user-visible references
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
+        # Remember origin so we can route the result back to the right channel/chat
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
+        # Launch the subagent as a fire-and-forget background task
         bg_task = asyncio.create_task(
             self._run_subagent(task_id, task, display_label, origin)
         )
@@ -70,6 +74,7 @@ class SubagentManager:
         if session_key:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
+        # Auto-cleanup tracking state when the task finishes (success or failure)
         def _cleanup(_: asyncio.Task) -> None:
             self._running_tasks.pop(task_id, None)
             if session_key and (ids := self._session_tasks.get(session_key)):
@@ -93,7 +98,9 @@ class SubagentManager:
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         try:
-            # Build subagent tools (no message tool, no spawn tool)
+            # Build an isolated tool registry for the subagent — intentionally
+            # excludes message and spawn tools to prevent subagents from
+            # sending messages directly or recursively spawning more subagents
             tools = ToolRegistry()
             allowed_dir = self.workspace if self.restrict_to_workspace else None
             tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -115,11 +122,12 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
-            # Run agent loop (limited iterations)
+            # Subagents have a lower iteration cap than the main agent to bound cost
             max_iterations = 15
             iteration = 0
             final_result: str | None = None
 
+            # Same loop pattern as the main agent: LLM → tool calls → repeat
             while iteration < max_iterations:
                 iteration += 1
 
@@ -163,6 +171,7 @@ class SubagentManager:
                             "content": result,
                         })
                 else:
+                    # No tool calls means the LLM produced its final answer
                     final_result = response.content
                     break
 
@@ -170,11 +179,13 @@ class SubagentManager:
                 final_result = "Task completed but no final response was generated."
 
             logger.info("Subagent [{}] completed successfully", task_id)
+            # Announce result back to the main agent via the message bus
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
 
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
+            # Even on failure, announce the error so the user knows what happened
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
 
     async def _announce_result(
@@ -189,6 +200,8 @@ class SubagentManager:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
 
+        # Build a prompt that asks the main agent to summarize the result
+        # naturally for the user, hiding implementation details
         announce_content = f"""[Subagent '{label}' {status_text}]
 
 Task: {task}
@@ -198,7 +211,9 @@ Result:
 
 Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
 
-        # Inject as system message to trigger main agent
+        # Inject as a "system" channel inbound message — the main agent loop
+        # will pick it up, process it, and send the summarized result to the
+        # original channel:chat_id encoded in the chat_id field
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",
@@ -210,10 +225,15 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
     
     def _build_subagent_prompt(self) -> str:
-        """Build a focused system prompt for the subagent."""
+        """Build a focused system prompt for the subagent.
+
+        Simpler than the main agent's prompt — no memory, no bootstrap files,
+        just runtime context, workspace path, and available skills.
+        """
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
 
+        # Reuse the main context builder's runtime context for consistent time info
         time_ctx = ContextBuilder._build_runtime_context(None, None)
         parts = [f"""# Subagent
 
@@ -225,6 +245,7 @@ Stay focused on the assigned task. Your final response will be reported back to 
 ## Workspace
 {self.workspace}"""]
 
+        # Give the subagent access to the same skills catalog (progressive loading)
         skills_summary = SkillsLoader(self.workspace).build_skills_summary()
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
@@ -233,10 +254,12 @@ Stay focused on the assigned task. Your final response will be reported back to 
     
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
+        # Find all non-completed tasks belonging to this session
         tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])
                  if tid in self._running_tasks and not self._running_tasks[tid].done()]
         for t in tasks:
             t.cancel()
+        # Wait for cancellation to propagate before returning
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         return len(tasks)

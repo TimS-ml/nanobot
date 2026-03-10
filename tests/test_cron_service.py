@@ -1,3 +1,6 @@
+# Tests for the CronService: timezone validation, job creation, and
+# runtime honoring of externally-disabled jobs.
+
 import asyncio
 
 import pytest
@@ -6,6 +9,7 @@ from nanobot.cron.service import CronService
 from nanobot.cron.types import CronSchedule
 
 
+# Verify that a typo in timezone name raises ValueError and job is not persisted
 def test_add_job_rejects_unknown_timezone(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json")
 
@@ -19,6 +23,7 @@ def test_add_job_rejects_unknown_timezone(tmp_path) -> None:
     assert service.list_jobs(include_disabled=True) == []
 
 
+# Verify a valid IANA timezone is accepted and next_run_at_ms is computed
 def test_add_job_accepts_valid_timezone(tmp_path) -> None:
     service = CronService(tmp_path / "cron" / "jobs.json")
 
@@ -32,6 +37,8 @@ def test_add_job_accepts_valid_timezone(tmp_path) -> None:
     assert job.state.next_run_at_ms is not None
 
 
+# Verify a running service picks up external disable (written to same store file)
+# and does NOT execute the job callback while disabled
 @pytest.mark.asyncio
 async def test_running_service_honors_external_disable(tmp_path) -> None:
     store_path = tmp_path / "cron" / "jobs.json"

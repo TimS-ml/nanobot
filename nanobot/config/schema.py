@@ -8,9 +8,12 @@ from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
 
+# All config models inherit from Base, which auto-generates camelCase aliases
+# so JSON keys like "bridgeUrl" map to Python snake_case fields like "bridge_url".
 class Base(BaseModel):
     """Base model that accepts both camelCase and snake_case keys."""
 
+    # populate_by_name=True allows both "bridge_url" and "bridgeUrl" as input keys
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
@@ -201,6 +204,7 @@ class QQConfig(Base):
 
 
 
+# Aggregates all channel-specific configs under a single namespace
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
@@ -247,6 +251,8 @@ class ProviderConfig(Base):
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
 
+# Each field name must match the provider registry name in providers/registry.py
+# so _match_provider can use getattr(self.providers, spec.name) to look up configs.
 class ProvidersConfig(Base):
     """Configuration for LLM providers."""
 
@@ -308,6 +314,7 @@ class ExecToolConfig(Base):
     path_append: str = ""
 
 
+# Supports both local subprocess (stdio) and remote HTTP (SSE/streamable) MCP servers
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -349,13 +356,16 @@ class Config(BaseSettings):
         """Match provider config and its registry name. Returns (config, spec_name)."""
         from nanobot.providers.registry import PROVIDERS
 
+        # If user explicitly set a provider (not "auto"), bypass all matching logic
         forced = self.agents.defaults.provider
         if forced != "auto":
             p = getattr(self.providers, forced, None)
             return (p, forced) if p else (None, None)
 
+        # Normalize model name for flexible matching (e.g. "deepseek/chat" or "openai/gpt-4")
         model_lower = (model or self.agents.defaults.model).lower()
         model_normalized = model_lower.replace("-", "_")
+        # Extract the prefix before "/" to match against provider names (e.g. "anthropic" from "anthropic/claude-3")
         model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
         normalized_prefix = model_prefix.replace("-", "_")
 
@@ -363,6 +373,7 @@ class Config(BaseSettings):
             kw = kw.lower()
             return kw in model_lower or kw.replace("-", "_") in model_normalized
 
+        # Priority 1: Exact prefix match — "github-copilot/..." maps to github_copilot provider.
         # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
@@ -370,6 +381,7 @@ class Config(BaseSettings):
                 if spec.is_oauth or p.api_key:
                     return p, spec.name
 
+        # Priority 2: Keyword-based match — checks if any provider keyword appears in model string
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
             p = getattr(self.providers, spec.name, None)
@@ -377,6 +389,7 @@ class Config(BaseSettings):
                 if spec.is_oauth or p.api_key:
                     return p, spec.name
 
+        # Priority 3: Fallback — pick the first provider that has an API key configured
         # Fallback: gateways first, then others (follows registry order)
         # OAuth providers are NOT valid fallbacks — they require explicit model selection
         for spec in PROVIDERS:
@@ -418,4 +431,5 @@ class Config(BaseSettings):
                 return spec.default_api_base
         return None
 
+    # Allows env var overrides like NANOBOT_AGENTS__DEFAULTS__MODEL for nested config
     model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")

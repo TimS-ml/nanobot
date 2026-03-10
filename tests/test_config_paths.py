@@ -1,3 +1,6 @@
+# Tests for config path resolution: instance-relative runtime dirs, channel-specific
+# media dirs, globally shared paths, and explicit workspace path resolution.
+
 from pathlib import Path
 
 from nanobot.config.paths import (
@@ -13,6 +16,7 @@ from nanobot.config.paths import (
 )
 
 
+# Verify runtime directories (data, cron, logs) live under the config file's parent dir
 def test_runtime_dirs_follow_config_path(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance-a" / "config.json"
     monkeypatch.setattr("nanobot.config.paths.get_config_path", lambda: config_file)
@@ -23,6 +27,7 @@ def test_runtime_dirs_follow_config_path(monkeypatch, tmp_path: Path) -> None:
     assert get_logs_dir() == config_file.parent / "logs"
 
 
+# Verify media dir supports optional channel name subdirectory (e.g., media/telegram)
 def test_media_dir_supports_channel_namespace(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance-b" / "config.json"
     monkeypatch.setattr("nanobot.config.paths.get_config_path", lambda: config_file)
@@ -31,12 +36,14 @@ def test_media_dir_supports_channel_namespace(monkeypatch, tmp_path: Path) -> No
     assert get_media_dir("telegram") == config_file.parent / "media" / "telegram"
 
 
+# Verify shared paths (CLI history, bridge, legacy sessions) remain under ~/.nanobot
 def test_shared_and_legacy_paths_remain_global() -> None:
     assert get_cli_history_path() == Path.home() / ".nanobot" / "history" / "cli_history"
     assert get_bridge_install_dir() == Path.home() / ".nanobot" / "bridge"
     assert get_legacy_sessions_dir() == Path.home() / ".nanobot" / "sessions"
 
 
+# Verify workspace path defaults to ~/.nanobot/workspace and resolves ~ in custom paths
 def test_workspace_path_is_explicitly_resolved() -> None:
     assert get_workspace_path() == Path.home() / ".nanobot" / "workspace"
     assert get_workspace_path("~/custom-workspace") == Path.home() / "custom-workspace"

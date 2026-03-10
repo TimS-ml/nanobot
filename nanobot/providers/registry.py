@@ -62,6 +62,7 @@ class ProviderSpec:
 
     @property
     def label(self) -> str:
+        """Human-readable display name, falling back to titlecased config name."""
         return self.display_name or self.name.title()
 
 
@@ -391,16 +392,21 @@ def find_by_model(model: str) -> ProviderSpec | None:
     """Match a standard provider by model-name keyword (case-insensitive).
     Skips gateways/local — those are matched by api_key/api_base instead."""
     model_lower = model.lower()
+    # Normalize hyphens to underscores for matching (e.g. "github-copilot" == "github_copilot")
     model_normalized = model_lower.replace("-", "_")
+    # Extract provider prefix from "provider/model" format if present
     model_prefix = model_lower.split("/", 1)[0] if "/" in model_lower else ""
     normalized_prefix = model_prefix.replace("-", "_")
+    # Only search standard providers; gateways/local are detected via find_gateway()
     std_specs = [s for s in PROVIDERS if not s.is_gateway and not s.is_local]
 
-    # Prefer explicit provider prefix — prevents `github-copilot/...codex` matching openai_codex.
+    # PASS 1: Exact prefix match has highest priority.
+    # Prevents ambiguous keyword matches (e.g. "github-copilot/...codex" matching openai_codex).
     for spec in std_specs:
         if model_prefix and normalized_prefix == spec.name:
             return spec
 
+    # PASS 2: Fall back to keyword substring matching against the full model name
     for spec in std_specs:
         if any(
             kw in model_lower or kw.replace("-", "_") in model_normalized for kw in spec.keywords
@@ -424,19 +430,21 @@ def find_gateway(
     A standard provider with a custom api_base (e.g. DeepSeek behind a proxy)
     will NOT be mistaken for vLLM — the old fallback is gone.
     """
-    # 1. Direct match by config key
+    # Priority 1: Direct match by config key name (most explicit signal)
     if provider_name:
         spec = find_by_name(provider_name)
         if spec and (spec.is_gateway or spec.is_local):
             return spec
 
-    # 2. Auto-detect by api_key prefix / api_base keyword
+    # Priority 2: Auto-detect by api_key prefix (e.g. "sk-or-" → OpenRouter)
+    # Priority 3: Auto-detect by api_base URL keyword (e.g. "aihubmix" → AiHubMix)
     for spec in PROVIDERS:
         if spec.detect_by_key_prefix and api_key and api_key.startswith(spec.detect_by_key_prefix):
             return spec
         if spec.detect_by_base_keyword and api_base and spec.detect_by_base_keyword in api_base:
             return spec
 
+    # No gateway detected — caller should use standard provider matching instead
     return None
 
 

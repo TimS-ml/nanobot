@@ -10,6 +10,7 @@ from nanobot.utils.helpers import ensure_dir
 
 def get_data_dir() -> Path:
     """Return the instance-level runtime data directory."""
+    # Data dir is the parent of the config file, so each config instance has its own data
     return ensure_dir(get_config_path().parent)
 
 
@@ -36,6 +37,7 @@ def get_logs_dir() -> Path:
 
 def get_workspace_path(workspace: str | None = None) -> Path:
     """Resolve and ensure the agent workspace path."""
+    # Expand ~ in user-provided paths; fall back to the default global workspace
     path = Path(workspace).expanduser() if workspace else Path.home() / ".nanobot" / "workspace"
     return ensure_dir(path)
 
@@ -52,4 +54,5 @@ def get_bridge_install_dir() -> Path:
 
 def get_legacy_sessions_dir() -> Path:
     """Return the legacy global session directory used for migration fallback."""
+    # Before per-workspace sessions, all sessions lived in this shared directory
     return Path.home() / ".nanobot" / "sessions"

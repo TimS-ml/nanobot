@@ -1,3 +1,6 @@
+# Tests for CLI commands: onboarding, agent invocation, gateway startup,
+# config/workspace path resolution, and provider model prefix handling.
+
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,9 +14,10 @@ from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.providers.openai_codex_provider import _strip_model_prefix
 from nanobot.providers.registry import find_by_model
 
-runner = CliRunner()
+runner = CliRunner
 
 
+# Sentinel exception to stop gateway startup at a controlled point
 class _StopGateway(RuntimeError):
     pass
 
@@ -100,6 +104,7 @@ def test_onboard_existing_workspace_safe_create(mock_paths):
     assert (workspace_dir / "AGENTS.md").exists()
 
 
+# Verify github-copilot/ hyphen prefix is recognized as "github_copilot" provider
 def test_config_matches_github_copilot_codex_with_hyphen_prefix():
     config = Config()
     config.agents.defaults.model = "github-copilot/gpt-5.3-codex"
@@ -107,6 +112,7 @@ def test_config_matches_github_copilot_codex_with_hyphen_prefix():
     assert config.get_provider_name() == "github_copilot"
 
 
+# Verify openai-codex/ hyphen prefix is recognized as "openai_codex" provider
 def test_config_matches_openai_codex_with_hyphen_prefix():
     config = Config()
     config.agents.defaults.model = "openai-codex/gpt-5.1-codex"
@@ -114,6 +120,7 @@ def test_config_matches_openai_codex_with_hyphen_prefix():
     assert config.get_provider_name() == "openai_codex"
 
 
+# Verify find_by_model prefers explicit provider prefix over generic "codex" keyword match
 def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
     spec = find_by_model("github-copilot/gpt-5.3-codex")
 
@@ -121,6 +128,7 @@ def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
     assert spec.name == "github_copilot"
 
 
+# Verify LiteLLM provider converts "github-copilot/" to "github_copilot/"
 def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
     provider = LiteLLMProvider(default_model="github-copilot/gpt-5.3-codex")
 
@@ -129,6 +137,7 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
     assert resolved == "github_copilot/gpt-5.3-codex"
 
 
+# Verify _strip_model_prefix handles both hyphen and underscore variants
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
@@ -166,6 +175,7 @@ def mock_agent_runtime(tmp_path):
         }
 
 
+# Verify the agent --help output includes --workspace and --config options
 def test_agent_help_shows_workspace_and_config_options():
     result = runner.invoke(app, ["agent", "--help"])
 
@@ -176,6 +186,7 @@ def test_agent_help_shows_workspace_and_config_options():
     assert "-c" in result.stdout
 
 
+# Verify agent uses default config and workspace when no CLI flags are given
 def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_runtime):
     result = runner.invoke(app, ["agent", "-m", "hello"])
 
@@ -191,6 +202,7 @@ def test_agent_uses_default_config_when_no_workspace_or_config_flags(mock_agent_
     mock_agent_runtime["print_response"].assert_called_once_with("mock-response", render_markdown=True)
 
 
+# Verify -c flag passes resolved config path to load_config
 def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):
     config_path = tmp_path / "agent-config.json"
     config_path.write_text("{}")
@@ -201,6 +213,7 @@ def test_agent_uses_explicit_config_path(mock_agent_runtime, tmp_path: Path):
     assert mock_agent_runtime["load_config"].call_args.args == (config_path.resolve(),)
 
 
+# Verify -c flag calls set_config_path so multi-instance configs work
 def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
@@ -239,6 +252,7 @@ def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
     assert seen["config_path"] == config_file.resolve()
 
 
+# Verify -w flag overrides the workspace path in both config and AgentLoop
 def test_agent_overrides_workspace_path(mock_agent_runtime):
     workspace_path = Path("/tmp/agent-workspace")
 
@@ -250,6 +264,7 @@ def test_agent_overrides_workspace_path(mock_agent_runtime):
     assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == workspace_path
 
 
+# Verify -w flag takes precedence over workspace path from config file
 def test_agent_workspace_override_wins_over_config_workspace(mock_agent_runtime, tmp_path: Path):
     config_path = tmp_path / "agent-config.json"
     config_path.write_text("{}")
@@ -267,6 +282,7 @@ def test_agent_workspace_override_wins_over_config_workspace(mock_agent_runtime,
     assert mock_agent_runtime["agent_loop_cls"].call_args.kwargs["workspace"] == workspace_path
 
 
+# Verify gateway reads workspace path from config when no --workspace flag given
 def test_gateway_uses_workspace_from_config_by_default(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
@@ -297,6 +313,7 @@ def test_gateway_uses_workspace_from_config_by_default(monkeypatch, tmp_path: Pa
     assert seen["workspace"] == Path(config.agents.defaults.workspace)
 
 
+# Verify gateway --workspace flag overrides the config-defined workspace
 def test_gateway_workspace_option_overrides_config(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)
@@ -328,6 +345,7 @@ def test_gateway_workspace_option_overrides_config(monkeypatch, tmp_path: Path) 
     assert config.workspace_path == override
 
 
+# Verify gateway stores cron jobs.json in the config directory, not in workspace
 def test_gateway_uses_config_directory_for_cron_store(monkeypatch, tmp_path: Path) -> None:
     config_file = tmp_path / "instance" / "config.json"
     config_file.parent.mkdir(parents=True)

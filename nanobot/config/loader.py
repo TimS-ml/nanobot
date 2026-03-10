@@ -6,7 +6,9 @@ from pathlib import Path
 from nanobot.config.schema import Config
 
 
-# Global variable to store current config path (for multi-instance support)
+# Global variable to store current config path (for multi-instance support).
+# When set, all path helpers derive their data directory from this path's parent,
+# enabling multiple nanobot instances with separate data directories.
 _current_config_path: Path | None = None
 
 
@@ -39,12 +41,15 @@ def load_config(config_path: Path | None = None) -> Config:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
+            # Apply any schema migrations before validation (e.g. relocated keys)
             data = _migrate_config(data)
+            # Pydantic validates and fills in defaults for missing fields
             return Config.model_validate(data)
         except (json.JSONDecodeError, ValueError) as e:
             print(f"Warning: Failed to load config from {path}: {e}")
             print("Using default configuration.")
 
+    # No config file found — return a fully default config
     return Config()
 
 
@@ -59,6 +64,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Serialize using camelCase aliases so the JSON file matches the expected schema
     data = config.model_dump(by_alias=True)
 
     with open(path, "w", encoding="utf-8") as f:
@@ -68,6 +74,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 def _migrate_config(data: dict) -> dict:
     """Migrate old config formats to current."""
     # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
+    # This key was relocated to the top-level tools section to apply globally
     tools = data.get("tools", {})
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:

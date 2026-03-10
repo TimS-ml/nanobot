@@ -1,3 +1,6 @@
+# Tests for the DingTalk channel: inbound group message routing and
+# outbound group message API call construction.
+
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +10,7 @@ from nanobot.channels.dingtalk import DingTalkChannel
 from nanobot.config.schema import DingTalkConfig
 
 
+# Fake HTTP response with configurable status and JSON body
 class _FakeResponse:
     def __init__(self, status_code: int = 200, json_body: dict | None = None) -> None:
         self.status_code = status_code
@@ -26,6 +30,7 @@ class _FakeHttp:
         return _FakeResponse()
 
 
+# Verify group messages set sender_id and prefix chat_id with "group:" + conversation_id
 @pytest.mark.asyncio
 async def test_group_message_keeps_sender_id_and_routes_chat_id() -> None:
     config = DingTalkConfig(client_id="app", client_secret="secret", allow_from=["user1"])
@@ -46,6 +51,7 @@ async def test_group_message_keeps_sender_id_and_routes_chat_id() -> None:
     assert msg.metadata["conversation_type"] == "2"
 
 
+# Verify _send_batch_message calls the correct DingTalk group messages API endpoint
 @pytest.mark.asyncio
 async def test_group_send_uses_group_messages_api() -> None:
     config = DingTalkConfig(client_id="app", client_secret="secret", allow_from=["*"])

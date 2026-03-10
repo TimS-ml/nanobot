@@ -14,6 +14,7 @@ class MessageBus:
     """
 
     def __init__(self):
+        # Unbounded queues — backpressure is handled at the channel level
         self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
         self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
 

@@ -9,6 +9,7 @@ import datetime as datetime_module
 from nanobot.agent.context import ContextBuilder
 
 
+# Controllable datetime stub to test clock-independence of the system prompt
 class _FakeDatetime(real_datetime):
     current = real_datetime(2026, 2, 24, 13, 59)
 

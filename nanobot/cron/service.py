@@ -13,6 +13,7 @@ from loguru import logger
 from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore
 
 
+# All timestamps in the cron system use milliseconds since epoch for consistency with JSON storage
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -20,12 +21,13 @@ def _now_ms() -> int:
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
     """Compute next run time in ms."""
     if schedule.kind == "at":
+        # One-shot: only fires if the target time is in the future
         return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
 
     if schedule.kind == "every":
         if not schedule.every_ms or schedule.every_ms <= 0:
             return None
-        # Next interval from now
+        # Simple interval: next run = now + interval (no drift correction)
         return now_ms + schedule.every_ms
 
     if schedule.kind == "cron" and schedule.expr:
@@ -33,7 +35,7 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
             from zoneinfo import ZoneInfo
 
             from croniter import croniter
-            # Use caller-provided reference time for deterministic scheduling
+            # Convert ms timestamp to timezone-aware datetime for croniter
             base_time = now_ms / 1000
             tz = ZoneInfo(schedule.tz) if schedule.tz else datetime.now().astimezone().tzinfo
             base_dt = datetime.fromtimestamp(base_time, tz=tz)
@@ -69,19 +71,20 @@ class CronService:
         on_job: Callable[[CronJob], Coroutine[Any, Any, str | None]] | None = None
     ):
         self.store_path = store_path
-        self.on_job = on_job
+        self.on_job = on_job  # Callback invoked when a job fires (set by gateway after agent creation)
         self._store: CronStore | None = None
-        self._last_mtime: float = 0.0
-        self._timer_task: asyncio.Task | None = None
+        self._last_mtime: float = 0.0  # Tracks file modification time for external-edit detection
+        self._timer_task: asyncio.Task | None = None  # Single asyncio task for the next wake-up
         self._running = False
 
     def _load_store(self) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
+        # Check if the on-disk file was modified since our last read (e.g. manual edit)
         if self._store and self.store_path.exists():
             mtime = self.store_path.stat().st_mtime
             if mtime != self._last_mtime:
                 logger.info("Cron: jobs.json modified externally, reloading")
-                self._store = None
+                self._store = None  # Force reload
         if self._store:
             return self._store
 
@@ -176,8 +179,10 @@ class CronService:
         """Start the cron service."""
         self._running = True
         self._load_store()
+        # Recompute all next-run times on startup (handles clock skew, missed jobs, etc.)
         self._recompute_next_runs()
         self._save_store()
+        # Schedule the asyncio timer for the earliest upcoming job
         self._arm_timer()
         logger.info("Cron service started with {} jobs", len(self._store.jobs if self._store else []))
 
@@ -206,7 +211,11 @@ class CronService:
         return min(times) if times else None
 
     def _arm_timer(self) -> None:
-        """Schedule the next timer tick."""
+        """Schedule the next timer tick.
+
+        Uses a single asyncio.sleep task rather than polling, so we only wake
+        when a job is actually due. Re-armed after each timer fire or job mutation.
+        """
         if self._timer_task:
             self._timer_task.cancel()
 
@@ -214,6 +223,7 @@ class CronService:
         if not next_wake or not self._running:
             return
 
+        # Calculate delay from now to the next job's scheduled time
         delay_ms = max(0, next_wake - _now_ms())
         delay_s = delay_ms / 1000
 
@@ -226,19 +236,23 @@ class CronService:
 
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
+        # Reload store in case it was modified externally since last read
         self._load_store()
         if not self._store:
             return
 
+        # Collect all jobs whose scheduled time has passed
         now = _now_ms()
         due_jobs = [
             j for j in self._store.jobs
             if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
         ]
 
+        # Execute due jobs sequentially (avoids concurrent agent turns)
         for job in due_jobs:
             await self._execute_job(job)
 
+        # Persist updated state and re-arm timer for the next due job
         self._save_store()
         self._arm_timer()
 
@@ -264,15 +278,16 @@ class CronService:
         job.state.last_run_at_ms = start_ms
         job.updated_at_ms = _now_ms()
 
-        # Handle one-shot jobs
+        # Handle one-shot "at" jobs: either delete or disable after firing
         if job.schedule.kind == "at":
             if job.delete_after_run:
                 self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
             else:
+                # Keep the job record for history, but prevent re-execution
                 job.enabled = False
                 job.state.next_run_at_ms = None
         else:
-            # Compute next run
+            # Repeating jobs ("every" or "cron"): schedule the next occurrence
             job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
 
     # ========== Public API ==========

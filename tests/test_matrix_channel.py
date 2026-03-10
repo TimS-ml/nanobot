@@ -1,3 +1,7 @@
+# Tests for the Matrix channel integration: client lifecycle, event callbacks,
+# message handling (text, media, threads), typing indicators, outbound sending
+# with markdown rendering, E2EE media encryption, and HTML sanitization.
+
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,9 +18,11 @@ from nanobot.channels.matrix import (
 )
 from nanobot.config.schema import MatrixConfig
 
+# Sentinel to detect whether ignore_unverified_devices kwarg was passed
 _ROOM_SEND_UNSET = object()
 
 
+# Fake async task that can be cancelled and awaited without a real coroutine
 class _DummyTask:
     def __init__(self) -> None:
         self.cancelled = False
@@ -31,6 +37,7 @@ class _DummyTask:
         return _done().__await__()
 
 
+# In-memory fake of nio.AsyncClient that records all API calls for assertions
 class _FakeAsyncClient:
     def __init__(self, homeserver, user, store_path, config) -> None:
         self.homeserver = homeserver
@@ -169,6 +176,7 @@ def _make_config(**kwargs) -> MatrixConfig:
     )
 
 
+# Verify that load_store() is skipped when no device_id is provided (no E2EE key store)
 @pytest.mark.asyncio
 async def test_start_skips_load_store_when_device_id_missing(
     monkeypatch, tmp_path
@@ -206,6 +214,7 @@ async def test_start_skips_load_store_when_device_id_missing(
     await channel.stop()
 
 
+# Verify that media event callback uses the correct base filter class
 @pytest.mark.asyncio
 async def test_register_event_callbacks_uses_media_base_filter() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -219,10 +228,12 @@ async def test_register_event_callbacks_uses_media_base_filter() -> None:
     assert client.callbacks[1][1] == matrix_module.MATRIX_MEDIA_EVENT_FILTER
 
 
+# Verify that plain text messages don't trigger the media event handler
 def test_media_event_filter_does_not_match_text_events() -> None:
     assert not issubclass(matrix_module.RoomMessageText, matrix_module.MATRIX_MEDIA_EVENT_FILTER)
 
 
+# Verify that E2EE is disabled when e2ee_enabled=False in config
 @pytest.mark.asyncio
 async def test_start_disables_e2ee_when_configured(
     monkeypatch, tmp_path
@@ -257,6 +268,7 @@ async def test_start_disables_e2ee_when_configured(
     await channel.stop()
 
 
+# Verify stop() calls stop_sync_forever on the nio client before closing
 @pytest.mark.asyncio
 async def test_stop_stops_sync_forever_before_close(monkeypatch) -> None:
     channel = MatrixChannel(_make_config(device_id="DEVICE"), MessageBus())
@@ -274,6 +286,7 @@ async def test_stop_stops_sync_forever_before_close(monkeypatch) -> None:
     assert task.cancelled is False
 
 
+# Verify room invites are ignored when allow_from list is empty
 @pytest.mark.asyncio
 async def test_room_invite_ignores_when_allow_list_is_empty() -> None:
     channel = MatrixChannel(_make_config(allow_from=[]), MessageBus())
@@ -288,6 +301,7 @@ async def test_room_invite_ignores_when_allow_list_is_empty() -> None:
     assert client.join_calls == []
 
 
+# Verify bot auto-joins room when invited by an allowed sender
 @pytest.mark.asyncio
 async def test_room_invite_joins_when_sender_allowed() -> None:
     channel = MatrixChannel(_make_config(allow_from=["@alice:matrix.org"]), MessageBus())
@@ -301,6 +315,7 @@ async def test_room_invite_joins_when_sender_allowed() -> None:
 
     assert client.join_calls == ["!room:matrix.org"]
 
+# Verify bot does NOT join room when invited by a user not in the allow list
 @pytest.mark.asyncio
 async def test_room_invite_respects_allow_list_when_configured() -> None:
     channel = MatrixChannel(_make_config(allow_from=["@bob:matrix.org"]), MessageBus())
@@ -315,6 +330,7 @@ async def test_room_invite_respects_allow_list_when_configured() -> None:
     assert client.join_calls == []
 
 
+# Verify typing indicator is sent and message is handled for allowed senders
 @pytest.mark.asyncio
 async def test_on_message_sets_typing_for_allowed_sender() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -339,6 +355,7 @@ async def test_on_message_sets_typing_for_allowed_sender() -> None:
     ]
 
 
+# Verify typing keepalive loop periodically re-sends typing=true until stopped
 @pytest.mark.asyncio
 async def test_typing_keepalive_refreshes_periodically(monkeypatch) -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -357,6 +374,7 @@ async def test_typing_keepalive_refreshes_periodically(monkeypatch) -> None:
     assert client.typing_calls[-1] == ("!room:matrix.org", False, TYPING_NOTICE_TIMEOUT_MS)
 
 
+# Verify that the bot's own messages do not trigger typing indicators
 @pytest.mark.asyncio
 async def test_on_message_skips_typing_for_self_message() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -371,6 +389,7 @@ async def test_on_message_skips_typing_for_self_message() -> None:
     assert client.typing_calls == []
 
 
+# Verify denied senders are neither handled nor shown typing indicators
 @pytest.mark.asyncio
 async def test_on_message_skips_typing_for_denied_sender() -> None:
     channel = MatrixChannel(_make_config(allow_from=["@bob:matrix.org"]), MessageBus())
@@ -393,6 +412,7 @@ async def test_on_message_skips_typing_for_denied_sender() -> None:
     assert client.typing_calls == []
 
 
+# Verify group_policy="mention" ignores messages without m.mentions in a group room
 @pytest.mark.asyncio
 async def test_on_message_mention_policy_requires_mx_mentions() -> None:
     channel = MatrixChannel(_make_config(group_policy="mention"), MessageBus())
@@ -415,6 +435,7 @@ async def test_on_message_mention_policy_requires_mx_mentions() -> None:
     assert client.typing_calls == []
 
 
+# Verify that messages with m.mentions containing the bot user_id are accepted
 @pytest.mark.asyncio
 async def test_on_message_mention_policy_accepts_bot_user_mentions() -> None:
     channel = MatrixChannel(_make_config(group_policy="mention"), MessageBus())
@@ -441,6 +462,7 @@ async def test_on_message_mention_policy_accepts_bot_user_mentions() -> None:
     assert client.typing_calls == [("!room:matrix.org", True, TYPING_NOTICE_TIMEOUT_MS)]
 
 
+# Verify mention policy allows DMs (member_count=2) without requiring explicit mentions
 @pytest.mark.asyncio
 async def test_on_message_mention_policy_allows_direct_room_without_mentions() -> None:
     channel = MatrixChannel(_make_config(group_policy="mention"), MessageBus())
@@ -463,6 +485,7 @@ async def test_on_message_mention_policy_allows_direct_room_without_mentions() -
     assert client.typing_calls == [("!dm:matrix.org", True, TYPING_NOTICE_TIMEOUT_MS)]
 
 
+# Verify allowlist group policy only processes messages from allowed room IDs
 @pytest.mark.asyncio
 async def test_on_message_allowlist_policy_requires_room_id() -> None:
     channel = MatrixChannel(
@@ -494,6 +517,7 @@ async def test_on_message_allowlist_policy_requires_room_id() -> None:
     assert client.typing_calls == [("!allowed:matrix.org", True, TYPING_NOTICE_TIMEOUT_MS)]
 
 
+# Verify @room mentions are ignored unless allow_room_mentions is enabled
 @pytest.mark.asyncio
 async def test_on_message_room_mention_requires_opt_in() -> None:
     channel = MatrixChannel(_make_config(group_policy="mention"), MessageBus())
@@ -524,6 +548,7 @@ async def test_on_message_room_mention_requires_opt_in() -> None:
     assert client.typing_calls == [("!room:matrix.org", True, TYPING_NOTICE_TIMEOUT_MS)]
 
 
+# Verify that threaded events (m.thread relation) populate thread metadata correctly
 @pytest.mark.asyncio
 async def test_on_message_sets_thread_metadata_when_threaded_event() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -561,6 +586,7 @@ async def test_on_message_sets_thread_metadata_when_threaded_event() -> None:
     assert metadata["event_id"] == "$reply1"
 
 
+# Verify media messages are downloaded to disk, metadata is populated, and typing is sent
 @pytest.mark.asyncio
 async def test_on_media_message_downloads_attachment_and_sets_metadata(
     monkeypatch, tmp_path
@@ -614,6 +640,7 @@ async def test_on_media_message_downloads_attachment_and_sets_metadata(
     assert "[attachment: " in handled[0]["content"]
 
 
+# Verify threaded media messages carry thread root/reply event IDs in metadata
 @pytest.mark.asyncio
 async def test_on_media_message_sets_thread_metadata_when_threaded_event(
     monkeypatch, tmp_path
@@ -659,6 +686,7 @@ async def test_on_media_message_sets_thread_metadata_when_threaded_event(
     assert metadata["event_id"] == "$event1"
 
 
+# Verify that media exceeding max_media_bytes is not downloaded (uses declared size)
 @pytest.mark.asyncio
 async def test_on_media_message_respects_declared_size_limit(
     monkeypatch, tmp_path
@@ -694,6 +722,7 @@ async def test_on_media_message_respects_declared_size_limit(
     assert "[attachment: large.bin - too large]" in handled[0]["content"]
 
 
+# Verify the server's upload_size limit takes precedence when smaller than local config
 @pytest.mark.asyncio
 async def test_on_media_message_uses_server_limit_when_smaller_than_local_limit(
     monkeypatch, tmp_path
@@ -730,6 +759,7 @@ async def test_on_media_message_uses_server_limit_when_smaller_than_local_limit(
     assert "[attachment: large.bin - too large]" in handled[0]["content"]
 
 
+# Verify graceful handling when the Matrix server returns a download error
 @pytest.mark.asyncio
 async def test_on_media_message_handles_download_error(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("nanobot.channels.matrix.get_data_dir", lambda: tmp_path)
@@ -764,6 +794,7 @@ async def test_on_media_message_handles_download_error(monkeypatch, tmp_path) ->
     assert "[attachment: photo.png - download failed]" in handled[0]["content"]
 
 
+# Verify encrypted media is decrypted via decrypt_attachment before saving to disk
 @pytest.mark.asyncio
 async def test_on_media_message_decrypts_encrypted_media(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("nanobot.channels.matrix.get_data_dir", lambda: tmp_path)
@@ -807,6 +838,7 @@ async def test_on_media_message_decrypts_encrypted_media(monkeypatch, tmp_path) 
     assert attachment["size_bytes"] == 5
 
 
+# Verify graceful handling when decryption fails with EncryptionError
 @pytest.mark.asyncio
 async def test_on_media_message_handles_decrypt_error(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr("nanobot.channels.matrix.get_data_dir", lambda: tmp_path)
@@ -848,6 +880,7 @@ async def test_on_media_message_handles_decrypt_error(monkeypatch, tmp_path) -> 
     assert "[attachment: secret.txt - download failed]" in handled[0]["content"]
 
 
+# Verify that send() clears typing indicator after successfully sending a message
 @pytest.mark.asyncio
 async def test_send_clears_typing_after_send() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -868,6 +901,7 @@ async def test_send_clears_typing_after_send() -> None:
     assert client.typing_calls[-1] == ("!room:matrix.org", False, TYPING_NOTICE_TIMEOUT_MS)
 
 
+# Verify that outbound messages with media files are uploaded then sent as m.file events
 @pytest.mark.asyncio
 async def test_send_uploads_media_and_sends_file_event(tmp_path) -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -897,6 +931,7 @@ async def test_send_uploads_media_and_sends_file_event(tmp_path) -> None:
     assert client.room_send_calls[1]["content"]["body"] == "Please review."
 
 
+# Verify outbound messages include m.relates_to for thread continuation
 @pytest.mark.asyncio
 async def test_send_adds_thread_relates_to_for_thread_metadata() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -925,6 +960,7 @@ async def test_send_adds_thread_relates_to_for_thread_metadata() -> None:
     }
 
 
+# Verify that media in encrypted rooms is uploaded with encrypt=True and uses "file" key
 @pytest.mark.asyncio
 async def test_send_uses_encrypted_media_payload_in_encrypted_room(tmp_path) -> None:
     channel = MatrixChannel(_make_config(e2ee_enabled=True), MessageBus())
@@ -955,6 +991,7 @@ async def test_send_uses_encrypted_media_payload_in_encrypted_room(tmp_path) -> 
     assert content["file"]["hashes"]["sha256"] == "hash"
 
 
+# Verify [attachment: ...] text is sent as-is when no media paths are provided
 @pytest.mark.asyncio
 async def test_send_does_not_parse_attachment_marker_without_media(tmp_path) -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -975,6 +1012,7 @@ async def test_send_does_not_parse_attachment_marker_without_media(tmp_path) -> 
     assert client.room_send_calls[0]["content"]["body"] == f"[attachment: {missing_path}]"
 
 
+# Verify thread relates_to metadata is forwarded to the attachment upload helper
 @pytest.mark.asyncio
 async def test_send_passes_thread_relates_to_to_attachment_upload(monkeypatch) -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1019,6 +1057,7 @@ async def test_send_passes_thread_relates_to_to_attachment_upload(monkeypatch) -
     }
 
 
+# Verify workspace restriction blocks media uploads from outside the workspace directory
 @pytest.mark.asyncio
 async def test_send_workspace_restriction_blocks_external_attachment(tmp_path) -> None:
     workspace = tmp_path / "workspace"
@@ -1049,6 +1088,7 @@ async def test_send_workspace_restriction_blocks_external_attachment(tmp_path) -
     assert client.room_send_calls[0]["content"]["body"] == "[attachment: external.txt - upload failed]"
 
 
+# Verify upload exceptions produce a "[upload failed]" marker in the text message
 @pytest.mark.asyncio
 async def test_send_handles_upload_exception_and_reports_failure(tmp_path) -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1076,6 +1116,7 @@ async def test_send_handles_upload_exception_and_reports_failure(tmp_path) -> No
     )
 
 
+# Verify server upload_size limit is used for outbound media when smaller than local limit
 @pytest.mark.asyncio
 async def test_send_uses_server_upload_limit_when_smaller_than_local_limit(tmp_path) -> None:
     channel = MatrixChannel(_make_config(max_media_bytes=10), MessageBus())
@@ -1100,6 +1141,7 @@ async def test_send_uses_server_upload_limit_when_smaller_than_local_limit(tmp_p
     assert client.room_send_calls[0]["content"]["body"] == "[attachment: tiny.txt - too large]"
 
 
+# Verify max_media_bytes=0 blocks all outbound media including zero-byte files
 @pytest.mark.asyncio
 async def test_send_blocks_all_outbound_media_when_limit_is_zero(tmp_path) -> None:
     channel = MatrixChannel(_make_config(max_media_bytes=0), MessageBus())
@@ -1123,6 +1165,7 @@ async def test_send_blocks_all_outbound_media_when_limit_is_zero(tmp_path) -> No
     assert client.room_send_calls[0]["content"]["body"] == "[attachment: empty.txt - too large]"
 
 
+# Verify ignore_unverified_devices kwarg is omitted when E2EE is disabled
 @pytest.mark.asyncio
 async def test_send_omits_ignore_unverified_devices_when_e2ee_disabled() -> None:
     channel = MatrixChannel(_make_config(e2ee_enabled=False), MessageBus())
@@ -1137,6 +1180,7 @@ async def test_send_omits_ignore_unverified_devices_when_e2ee_disabled() -> None
     assert "ignore_unverified_devices" not in client.room_send_calls[0]
 
 
+# Verify that send() stops and removes the typing keepalive task for the room
 @pytest.mark.asyncio
 async def test_send_stops_typing_keepalive_task() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1155,6 +1199,7 @@ async def test_send_stops_typing_keepalive_task() -> None:
     assert client.typing_calls[-1] == ("!room:matrix.org", False, TYPING_NOTICE_TIMEOUT_MS)
 
 
+# Verify progress messages (reasoning) keep the typing keepalive alive instead of stopping it
 @pytest.mark.asyncio
 async def test_send_progress_keeps_typing_keepalive_running() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1180,6 +1225,7 @@ async def test_send_progress_keeps_typing_keepalive_running() -> None:
     await channel.stop()
 
 
+# Verify typing is cleared even when sending a message raises an exception
 @pytest.mark.asyncio
 async def test_send_clears_typing_when_send_fails() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1195,6 +1241,7 @@ async def test_send_clears_typing_when_send_fails() -> None:
     assert client.typing_calls[-1] == ("!room:matrix.org", False, TYPING_NOTICE_TIMEOUT_MS)
 
 
+# Verify markdown content is rendered to HTML formatted_body with correct format field
 @pytest.mark.asyncio
 async def test_send_adds_formatted_body_for_markdown() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1216,6 +1263,7 @@ async def test_send_adds_formatted_body_for_markdown() -> None:
     assert "<li>[x] done</li>" in str(content["formatted_body"])
 
 
+# Verify autolinked URLs, superscript (^2^) and subscript (~2~) render correctly
 @pytest.mark.asyncio
 async def test_send_adds_formatted_body_for_inline_url_superscript_subscript() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1239,6 +1287,7 @@ async def test_send_adds_formatted_body_for_inline_url_superscript_subscript() -
     assert "<sub>2</sub>" in str(content["formatted_body"])
 
 
+# Verify javascript: URIs are sanitized out of rendered HTML
 @pytest.mark.asyncio
 async def test_send_sanitizes_disallowed_link_scheme() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1256,6 +1305,7 @@ async def test_send_sanitizes_disallowed_link_scheme() -> None:
     assert "href=" not in formatted_body
 
 
+# Verify the HTML cleaner removes <script> tags and onclick event handlers
 def test_matrix_html_cleaner_strips_event_handlers_and_script_tags() -> None:
     dirty_html = '<a href="https://example.com" onclick="evil()">x</a><script>alert(1)</script>'
     cleaned_html = matrix_module.MATRIX_HTML_CLEANER.clean(dirty_html)
@@ -1265,6 +1315,7 @@ def test_matrix_html_cleaner_strips_event_handlers_and_script_tags() -> None:
     assert '<a href="https://example.com"' in cleaned_html
 
 
+# Verify only mxc:// image sources are allowed; https:// images are stripped
 @pytest.mark.asyncio
 async def test_send_keeps_only_mxc_image_sources() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1281,6 +1332,7 @@ async def test_send_keeps_only_mxc_image_sources() -> None:
     assert 'src="https://example.com/a.png"' not in formatted_body
 
 
+# Verify graceful fallback to plain text when the markdown renderer raises an exception
 @pytest.mark.asyncio
 async def test_send_falls_back_to_plaintext_when_markdown_render_fails(monkeypatch) -> None:
     channel = MatrixChannel(_make_config(), MessageBus())
@@ -1300,6 +1352,7 @@ async def test_send_falls_back_to_plaintext_when_markdown_render_fails(monkeypat
     assert content == {"msgtype": "m.text", "body": markdown_text, "m.mentions": {}}
 
 
+# Verify plain text without markdown markers is sent without formatted_body
 @pytest.mark.asyncio
 async def test_send_keeps_plaintext_only_for_plain_text() -> None:
     channel = MatrixChannel(_make_config(), MessageBus())

@@ -15,10 +15,14 @@ class MCPToolWrapper(Tool):
     """Wraps a single MCP server tool as a nanobot Tool."""
 
     def __init__(self, session, server_name: str, tool_def, tool_timeout: int = 30):
+        # Keep a reference to the live MCP session for making tool calls
         self._session = session
+        # Preserve the original tool name for call_tool() — the wrapper name is namespaced
         self._original_name = tool_def.name
+        # Prefix with mcp_{server} to avoid name collisions between MCP servers and native tools
         self._name = f"mcp_{server_name}_{tool_def.name}"
         self._description = tool_def.description or tool_def.name
+        # Fall back to an empty object schema if the MCP tool defines no input schema
         self._parameters = tool_def.inputSchema or {"type": "object", "properties": {}}
         self._tool_timeout = tool_timeout
 
@@ -37,6 +41,7 @@ class MCPToolWrapper(Tool):
     async def execute(self, **kwargs: Any) -> str:
         from mcp import types
         try:
+            # Forward the call to the remote MCP server, using the original (un-namespaced) tool name
             result = await asyncio.wait_for(
                 self._session.call_tool(self._original_name, arguments=kwargs),
                 timeout=self._tool_timeout,
@@ -44,6 +49,7 @@ class MCPToolWrapper(Tool):
         except asyncio.TimeoutError:
             logger.warning("MCP tool '{}' timed out after {}s", self._name, self._tool_timeout)
             return f"(MCP tool call timed out after {self._tool_timeout}s)"
+        # Extract text from the MCP result content blocks; non-text blocks are stringified
         parts = []
         for block in result.content:
             if isinstance(block, types.TextContent):
@@ -64,6 +70,7 @@ async def connect_mcp_servers(
 
     for name, cfg in mcp_servers.items():
         try:
+            # Auto-detect transport type from config if not explicitly specified
             transport_type = cfg.type
             if not transport_type:
                 if cfg.command:
@@ -77,17 +84,21 @@ async def connect_mcp_servers(
                     logger.warning("MCP server '{}': no command or url configured, skipping", name)
                     continue
 
+            # Set up the appropriate transport based on the detected/configured type
             if transport_type == "stdio":
+                # Stdio transport: launch the MCP server as a child process
                 params = StdioServerParameters(
                     command=cfg.command, args=cfg.args, env=cfg.env or None
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
             elif transport_type == "sse":
+                # SSE transport: connect over HTTP with Server-Sent Events
                 def httpx_client_factory(
                     headers: dict[str, str] | None = None,
                     timeout: httpx.Timeout | None = None,
                     auth: httpx.Auth | None = None,
                 ) -> httpx.AsyncClient:
+                    # Merge user-configured headers with per-request headers from the MCP client
                     merged_headers = {**(cfg.headers or {}), **(headers or {})}
                     return httpx.AsyncClient(
                         headers=merged_headers or None,
@@ -116,9 +127,11 @@ async def connect_mcp_servers(
                 logger.warning("MCP server '{}': unknown transport type '{}'", name, transport_type)
                 continue
 
+            # Initialize the MCP session and discover available tools
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
 
+            # Wrap each remote tool as a native nanobot Tool and register it
             tools = await session.list_tools()
             for tool_def in tools.tools:
                 wrapper = MCPToolWrapper(session, name, tool_def, tool_timeout=cfg.tool_timeout)
@@ -127,4 +140,5 @@ async def connect_mcp_servers(
 
             logger.info("MCP server '{}': connected, {} tools registered", name, len(tools.tools))
         except Exception as e:
+            # Log but don't crash — other MCP servers and native tools should still work
             logger.error("MCP server '{}': failed to connect: {}", name, e)

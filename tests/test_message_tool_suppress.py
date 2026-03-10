@@ -1,4 +1,8 @@
-"""Test message tool suppress logic for final replies."""
+"""Test message tool suppress logic for final replies.
+
+Tests that the agent loop correctly suppresses duplicate final replies when
+the message tool already sent a response to the same channel/chat target.
+"""
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -12,6 +16,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
+# Helper to create an AgentLoop with a mocked provider for testing
 def _make_loop(tmp_path: Path) -> AgentLoop:
     bus = MessageBus()
     provider = MagicMock()
@@ -22,6 +27,8 @@ def _make_loop(tmp_path: Path) -> AgentLoop:
 class TestMessageToolSuppressLogic:
     """Final reply suppressed only when message tool sends to the same target."""
 
+    # Verify that the final LLM reply is suppressed when message tool already
+    # sent a response to the same channel+chat_id as the inbound message
     @pytest.mark.asyncio
     async def test_suppress_when_sent_to_same_target(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
@@ -47,6 +54,8 @@ class TestMessageToolSuppressLogic:
         assert len(sent) == 1
         assert result is None  # suppressed
 
+    # Verify that the final LLM reply is NOT suppressed when message tool sent
+    # to a different channel/chat_id than the inbound message
     @pytest.mark.asyncio
     async def test_not_suppress_when_sent_to_different_target(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
@@ -74,6 +83,7 @@ class TestMessageToolSuppressLogic:
         assert result is not None  # not suppressed
         assert result.channel == "feishu"
 
+    # Verify that a normal reply is returned when no message tool was invoked
     @pytest.mark.asyncio
     async def test_not_suppress_when_no_message_tool_used(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
@@ -86,6 +96,8 @@ class TestMessageToolSuppressLogic:
         assert result is not None
         assert "Hello" in result.content
 
+    # Verify that <think> blocks, reasoning_content, and thinking_blocks are
+    # stripped from progress updates sent to the user
     async def test_progress_hides_internal_reasoning(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
@@ -117,7 +129,9 @@ class TestMessageToolSuppressLogic:
 
 
 class TestMessageToolTurnTracking:
+    """Tests for per-turn tracking of whether message tool sent to the current target."""
 
+    # Verify the _sent_in_turn flag can be set and read correctly
     def test_sent_in_turn_tracks_same_target(self) -> None:
         tool = MessageTool()
         tool.set_context("feishu", "chat1")
@@ -125,6 +139,7 @@ class TestMessageToolTurnTracking:
         tool._sent_in_turn = True
         assert tool._sent_in_turn
 
+    # Verify that start_turn() resets the sent-in-turn flag for a new conversation turn
     def test_start_turn_resets(self) -> None:
         tool = MessageTool()
         tool._sent_in_turn = True

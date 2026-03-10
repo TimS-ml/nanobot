@@ -11,10 +11,14 @@ def _resolve_path(
     path: str, workspace: Path | None = None, allowed_dir: Path | None = None
 ) -> Path:
     """Resolve path against workspace (if relative) and enforce directory restriction."""
+    # Expand ~ to home directory
     p = Path(path).expanduser()
+    # Join relative paths with the workspace root so tools work from the project directory
     if not p.is_absolute() and workspace:
         p = workspace / p
+    # Resolve symlinks and normalize the path
     resolved = p.resolve()
+    # Security: ensure the final path is within the allowed directory (sandbox enforcement)
     if allowed_dir:
         try:
             resolved.relative_to(allowed_dir.resolve())
@@ -26,6 +30,7 @@ def _resolve_path(
 class ReadFileTool(Tool):
     """Tool to read file contents."""
 
+    # Hard limit on returned content to prevent blowing up the LLM context window
     _MAX_CHARS = 128_000  # ~128 KB — prevents OOM from reading huge files into LLM context
 
     def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None):
@@ -56,6 +61,7 @@ class ReadFileTool(Tool):
             if not file_path.is_file():
                 return f"Error: Not a file: {path}"
 
+            # Pre-check file size before reading to avoid loading huge files into memory
             size = file_path.stat().st_size
             if size > self._MAX_CHARS * 4:  # rough upper bound (UTF-8 chars ≤ 4 bytes)
                 return (
@@ -64,6 +70,7 @@ class ReadFileTool(Tool):
                 )
 
             content = file_path.read_text(encoding="utf-8")
+            # Truncate if content exceeds the character limit (e.g., binary-like files with small byte size)
             if len(content) > self._MAX_CHARS:
                 return content[: self._MAX_CHARS] + f"\n\n... (truncated — file is {len(content):,} chars, limit {self._MAX_CHARS:,})"
             return content
@@ -102,6 +109,7 @@ class WriteFileTool(Tool):
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            # Auto-create parent directories so the agent doesn't need a separate mkdir step
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
             return f"Successfully wrote {len(content)} bytes to {file_path}"
@@ -146,14 +154,16 @@ class EditFileTool(Tool):
 
             content = file_path.read_text(encoding="utf-8")
 
+            # If old_text isn't found, produce a diff-based error showing the closest match
             if old_text not in content:
                 return self._not_found_message(old_text, content, path)
 
-            # Count occurrences
+            # Reject ambiguous edits — require the match to be unique
             count = content.count(old_text)
             if count > 1:
                 return f"Warning: old_text appears {count} times. Please provide more context to make it unique."
 
+            # Replace only the first (and only) occurrence
             new_content = content.replace(old_text, new_text, 1)
             file_path.write_text(new_content, encoding="utf-8")
 
@@ -170,12 +180,14 @@ class EditFileTool(Tool):
         old_lines = old_text.splitlines(keepends=True)
         window = len(old_lines)
 
+        # Slide a window over the file to find the most similar region
         best_ratio, best_start = 0.0, 0
         for i in range(max(1, len(lines) - window + 1)):
             ratio = difflib.SequenceMatcher(None, old_lines, lines[i : i + window]).ratio()
             if ratio > best_ratio:
                 best_ratio, best_start = ratio, i
 
+        # If a reasonably similar block was found, show a unified diff to help the agent self-correct
         if best_ratio > 0.5:
             diff = "\n".join(
                 difflib.unified_diff(

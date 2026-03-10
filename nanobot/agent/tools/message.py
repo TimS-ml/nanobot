@@ -16,10 +16,13 @@ class MessageTool(Tool):
         default_chat_id: str = "",
         default_message_id: str | None = None,
     ):
+        # Async callback provided by the gateway (e.g., Telegram, Discord) to actually deliver messages
         self._send_callback = send_callback
+        # Default routing context — set per incoming message so the agent replies to the right place
         self._default_channel = default_channel
         self._default_chat_id = default_chat_id
         self._default_message_id = default_message_id
+        # Tracks whether the agent has already sent a message this turn (used for dedup logic)
         self._sent_in_turn: bool = False
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
@@ -79,6 +82,7 @@ class MessageTool(Tool):
         media: list[str] | None = None,
         **kwargs: Any
     ) -> str:
+        # Fall back to defaults so the agent doesn't need to specify routing every time
         channel = channel or self._default_channel
         chat_id = chat_id or self._default_chat_id
         message_id = message_id or self._default_message_id
@@ -89,6 +93,7 @@ class MessageTool(Tool):
         if not self._send_callback:
             return "Error: Message sending not configured"
 
+        # Build the outbound message envelope with optional media attachments
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
@@ -101,6 +106,7 @@ class MessageTool(Tool):
 
         try:
             await self._send_callback(msg)
+            # Only mark as "sent in turn" when replying to the same conversation (not cross-posting)
             if channel == self._default_channel and chat_id == self._default_chat_id:
                 self._sent_in_turn = True
             media_info = f" with {len(media)} attachments" if media else ""

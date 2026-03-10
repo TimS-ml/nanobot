@@ -16,7 +16,9 @@ from nanobot.utils.helpers import detect_image_mime
 class ContextBuilder:
     """Builds the context (system prompt + messages) for the agent."""
 
+    # Workspace-level files loaded into the system prompt to configure agent behavior
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    # Tag used to mark ephemeral metadata blocks that should not be persisted in history
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
     def __init__(self, workspace: Path):
@@ -26,22 +28,28 @@ class ContextBuilder:
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
+        # Layer 1: Core identity and guidelines (always present)
         parts = [self._get_identity()]
 
+        # Layer 2: User-provided bootstrap files (persona, tool config, etc.)
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
 
+        # Layer 3: Consolidated long-term memory from past sessions
         memory = self.memory.get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
+        # Layer 4: Skills marked always=true are injected in full
         always_skills = self.skills.get_always_skills()
         if always_skills:
             always_content = self.skills.load_skills_for_context(always_skills)
             if always_content:
                 parts.append(f"# Active Skills\n\n{always_content}")
 
+        # Layer 5: Summary of all available skills (progressive loading —
+        # the agent reads full SKILL.md on demand via read_file)
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
             parts.append(f"""# Skills
@@ -84,6 +92,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
     @staticmethod
     def _build_runtime_context(channel: str | None, chat_id: str | None) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
+        # Provides the LLM with current time and routing info so it can
+        # give time-aware responses and know which channel it's speaking on.
+        # Marked as "metadata only" so the LLM doesn't treat it as user instructions.
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         tz = time.strftime("%Z") or "UTC"
         lines = [f"Current Time: {now} ({tz})"]
@@ -121,8 +132,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if isinstance(user_content, str):
             merged = f"{runtime_ctx}\n\n{user_content}"
         else:
+            # Multimodal: prepend runtime context as a text block before images
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
+        # Final message list: system prompt → session history → current user turn
         return [
             {"role": "system", "content": self.build_system_prompt(skill_names)},
             *history,
@@ -131,9 +144,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
+        # Plain text when no media attachments
         if not media:
             return text
 
+        # Convert media file paths to inline base64 image blocks for the LLM
         images = []
         for path in media:
             p = Path(path)
@@ -149,6 +164,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         if not images:
             return text
+        # Return multimodal content: images first, then text (order matters for some models)
         return images + [{"type": "text", "text": text}]
 
     def add_tool_result(
@@ -170,6 +186,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         msg: dict[str, Any] = {"role": "assistant", "content": content}
         if tool_calls:
             msg["tool_calls"] = tool_calls
+        # Preserve extended thinking metadata from reasoning models (e.g. o1, DeepSeek)
         if reasoning_content is not None:
             msg["reasoning_content"] = reasoning_content
         if thinking_blocks:

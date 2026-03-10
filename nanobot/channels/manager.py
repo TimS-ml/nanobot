@@ -26,13 +26,17 @@ class ChannelManager:
     def __init__(self, config: Config, bus: MessageBus):
         self.config = config
         self.bus = bus
-        self.channels: dict[str, BaseChannel] = {}
-        self._dispatch_task: asyncio.Task | None = None
+        self.channels: dict[str, BaseChannel] = {}  # name → channel instance
+        self._dispatch_task: asyncio.Task | None = None  # Outbound message dispatcher
 
         self._init_channels()
 
     def _init_channels(self) -> None:
-        """Initialize channels based on config."""
+        """Initialize channels based on config.
+
+        Each channel is lazily imported to avoid pulling in heavy dependencies
+        (e.g. telegram SDK) when the channel is disabled.
+        """
 
         # Telegram channel
         if self.config.channels.telegram.enabled:
@@ -153,6 +157,10 @@ class ChannelManager:
         self._validate_allow_from()
 
     def _validate_allow_from(self) -> None:
+        """Hard fail on startup if any enabled channel has an empty allow_from list.
+
+        This prevents accidental lockouts where the bot is running but rejects all messages.
+        """
         for name, ch in self.channels.items():
             if getattr(ch.config, "allow_from", None) == []:
                 raise SystemExit(
@@ -173,16 +181,16 @@ class ChannelManager:
             logger.warning("No channels enabled")
             return
 
-        # Start outbound dispatcher
+        # Start the outbound dispatcher first so responses can be delivered as soon as channels connect
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
 
-        # Start channels
+        # Start all channels concurrently — each channel.start() is a long-running listener
         tasks = []
         for name, channel in self.channels.items():
             logger.info("Starting {} channel...", name)
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
 
-        # Wait for all to complete (they should run forever)
+        # Wait for all to complete (they should run forever unless an error occurs)
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def stop_all(self) -> None:
@@ -206,22 +214,29 @@ class ChannelManager:
                 logger.error("Error stopping {}: {}", name, e)
 
     async def _dispatch_outbound(self) -> None:
-        """Dispatch outbound messages to the appropriate channel."""
+        """Dispatch outbound messages to the appropriate channel.
+
+        Runs as a long-lived task, polling the outbound bus queue and routing
+        each message to the correct channel's send() method.
+        """
         logger.info("Outbound dispatcher started")
 
         while True:
             try:
+                # 1s timeout allows graceful cancellation checks
                 msg = await asyncio.wait_for(
                     self.bus.consume_outbound(),
                     timeout=1.0
                 )
 
+                # Filter progress/tool-hint messages based on global config
                 if msg.metadata.get("_progress"):
                     if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
                         continue
                     if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue
 
+                # Route to the target channel by name (e.g. "telegram", "whatsapp")
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:

@@ -19,8 +19,10 @@ MAX_REDIRECTS = 5  # Limit redirects to prevent DoS attacks
 
 def _strip_tags(text: str) -> str:
     """Remove HTML tags and decode entities."""
+    # Remove script and style blocks first to avoid their content leaking into text
     text = re.sub(r'<script[\s\S]*?</script>', '', text, flags=re.I)
     text = re.sub(r'<style[\s\S]*?</style>', '', text, flags=re.I)
+    # Strip remaining HTML tags and decode HTML entities (e.g., &amp; -> &)
     text = re.sub(r'<[^>]+>', '', text)
     return html.unescape(text).strip()
 
@@ -35,6 +37,7 @@ def _validate_url(url: str) -> tuple[bool, str]:
     """Validate URL: must be http(s) with valid domain."""
     try:
         p = urlparse(url)
+        # Reject non-HTTP schemes (e.g., file://, ftp://) to prevent SSRF
         if p.scheme not in ('http', 'https'):
             return False, f"Only http/https allowed, got '{p.scheme or 'none'}'"
         if not p.netloc:
@@ -61,11 +64,13 @@ class WebSearchTool(Tool):
     def __init__(self, api_key: str | None = None, max_results: int = 5, proxy: str | None = None):
         self._init_api_key = api_key
         self.max_results = max_results
+        # Optional HTTP proxy for all outbound requests (useful in restricted networks)
         self.proxy = proxy
 
     @property
     def api_key(self) -> str:
         """Resolve API key at call time so env/config changes are picked up."""
+        # Deferred resolution: checks constructor value first, then falls back to env var
         return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
@@ -77,6 +82,7 @@ class WebSearchTool(Tool):
             )
 
         try:
+            # Clamp result count to the API's allowed range [1, 10]
             n = min(max(count or self.max_results, 1), 10)
             logger.debug("WebSearch: {}", "proxy enabled" if self.proxy else "direct connection")
             async with httpx.AsyncClient(proxy=self.proxy) as client:
@@ -88,10 +94,12 @@ class WebSearchTool(Tool):
                 )
                 r.raise_for_status()
 
+            # Extract web results from the Brave API response structure
             results = r.json().get("web", {}).get("results", [])[:n]
             if not results:
                 return f"No results for: {query}"
 
+            # Format results as numbered list with title, URL, and optional description
             lines = [f"Results for: {query}\n"]
             for i, item in enumerate(results, 1):
                 lines.append(f"{i}. {item.get('title', '')}\n   {item.get('url', '')}")
@@ -122,6 +130,7 @@ class WebFetchTool(Tool):
     }
 
     def __init__(self, max_chars: int = 50000, proxy: str | None = None):
+        # Default character limit for extracted content returned to the LLM
         self.max_chars = max_chars
         self.proxy = proxy
 
@@ -129,6 +138,7 @@ class WebFetchTool(Tool):
         from readability import Document
 
         max_chars = maxChars or self.max_chars
+        # Validate URL before making any HTTP request
         is_valid, error_msg = _validate_url(url)
         if not is_valid:
             return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url}, ensure_ascii=False)
@@ -144,18 +154,23 @@ class WebFetchTool(Tool):
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
 
+            # Determine extraction strategy based on response content type
             ctype = r.headers.get("content-type", "")
 
             if "application/json" in ctype:
+                # JSON responses are pretty-printed directly
                 text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"
             elif "text/html" in ctype or r.text[:256].lower().startswith(("<!doctype", "<html")):
+                # Use Readability to extract main content, stripping nav/ads/chrome
                 doc = Document(r.text)
                 content = self._to_markdown(doc.summary()) if extractMode == "markdown" else _strip_tags(doc.summary())
                 text = f"# {doc.title()}\n\n{content}" if doc.title() else content
                 extractor = "readability"
             else:
+                # Non-HTML/JSON content is returned as-is
                 text, extractor = r.text, "raw"
 
+            # Truncate to stay within the character budget
             truncated = len(text) > max_chars
             if truncated: text = text[:max_chars]
 
@@ -171,11 +186,17 @@ class WebFetchTool(Tool):
     def _to_markdown(self, html: str) -> str:
         """Convert HTML to markdown."""
         # Convert links, headings, lists before stripping tags
+        # Transform <a> tags into [text](url) markdown links
         text = re.sub(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</a>',
                       lambda m: f'[{_strip_tags(m[2])}]({m[1]})', html, flags=re.I)
+        # Transform <h1>-<h6> into markdown heading levels
         text = re.sub(r'<h([1-6])[^>]*>([\s\S]*?)</h\1>',
                       lambda m: f'\n{"#" * int(m[1])} {_strip_tags(m[2])}\n', text, flags=re.I)
+        # Transform <li> into markdown list items
         text = re.sub(r'<li[^>]*>([\s\S]*?)</li>', lambda m: f'\n- {_strip_tags(m[1])}', text, flags=re.I)
+        # Block-level closing tags become paragraph breaks
         text = re.sub(r'</(p|div|section|article)>', '\n\n', text, flags=re.I)
+        # Line-break elements become newlines
         text = re.sub(r'<(br|hr)\s*/?>', '\n', text, flags=re.I)
+        # Strip any remaining HTML tags and normalize whitespace
         return _normalize(_strip_tags(text))

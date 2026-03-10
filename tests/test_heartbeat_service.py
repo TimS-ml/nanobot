@@ -1,3 +1,6 @@
+# Tests for the HeartbeatService which periodically checks whether scheduled
+# tasks should run by asking the LLM to decide via a tool call.
+
 import asyncio
 
 import pytest
@@ -6,6 +9,7 @@ from nanobot.heartbeat.service import HeartbeatService
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
+# Minimal LLM provider stub that returns pre-configured responses in order
 class DummyProvider:
     def __init__(self, responses: list[LLMResponse]):
         self._responses = list(responses)
@@ -16,6 +20,7 @@ class DummyProvider:
         return LLMResponse(content="", tool_calls=[])
 
 
+# Verify calling start() twice does not spawn a duplicate background task
 @pytest.mark.asyncio
 async def test_start_is_idempotent(tmp_path) -> None:
     provider = DummyProvider([])
@@ -38,6 +43,7 @@ async def test_start_is_idempotent(tmp_path) -> None:
     await asyncio.sleep(0)
 
 
+# Verify _decide returns "skip" when the LLM responds without a heartbeat tool call
 @pytest.mark.asyncio
 async def test_decide_returns_skip_when_no_tool_call(tmp_path) -> None:
     provider = DummyProvider([LLMResponse(content="no tool call", tool_calls=[])])
@@ -52,6 +58,7 @@ async def test_decide_returns_skip_when_no_tool_call(tmp_path) -> None:
     assert tasks == ""
 
 
+# Verify trigger_now calls on_execute with the LLM-provided tasks when decision is "run"
 @pytest.mark.asyncio
 async def test_trigger_now_executes_when_decision_is_run(tmp_path) -> None:
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] do thing", encoding="utf-8")
@@ -87,6 +94,7 @@ async def test_trigger_now_executes_when_decision_is_run(tmp_path) -> None:
     assert called_with == ["check open tasks"]
 
 
+# Verify trigger_now returns None when the LLM decides to skip (action="skip")
 @pytest.mark.asyncio
 async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
     (tmp_path / "HEARTBEAT.md").write_text("- [ ] do thing", encoding="utf-8")

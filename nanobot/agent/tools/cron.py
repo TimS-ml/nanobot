@@ -13,8 +13,10 @@ class CronTool(Tool):
 
     def __init__(self, cron_service: CronService):
         self._cron = cron_service
+        # Delivery target — set per incoming message so scheduled jobs deliver to the right chat
         self._channel = ""
         self._chat_id = ""
+        # ContextVar tracks whether we're inside a cron callback to prevent recursive scheduling
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
 
     def set_context(self, channel: str, chat_id: str) -> None:
@@ -81,7 +83,9 @@ class CronTool(Tool):
         job_id: str | None = None,
         **kwargs: Any,
     ) -> str:
+        # Dispatch to the appropriate sub-action handler
         if action == "add":
+            # Guard: prevent infinite loops where a cron job schedules more cron jobs
             if self._in_cron_context.get():
                 return "Error: cannot schedule new jobs from within a cron job execution"
             return self._add_job(message, every_seconds, cron_expr, tz, at)
@@ -103,8 +107,10 @@ class CronTool(Tool):
             return "Error: message is required for add"
         if not self._channel or not self._chat_id:
             return "Error: no session context (channel/chat_id)"
+        # Timezone only makes sense with cron expressions (not interval or one-shot)
         if tz and not cron_expr:
             return "Error: tz can only be used with cron_expr"
+        # Validate timezone string against the IANA database
         if tz:
             from zoneinfo import ZoneInfo
 
@@ -113,13 +119,16 @@ class CronTool(Tool):
             except (KeyError, Exception):
                 return f"Error: unknown timezone '{tz}'"
 
-        # Build schedule
+        # Build the schedule object from exactly one of the three scheduling modes
         delete_after = False
         if every_seconds:
+            # Recurring interval — convert seconds to milliseconds for internal storage
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
+            # Standard cron expression with optional timezone
             schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
         elif at:
+            # One-shot execution at a specific datetime — auto-delete after firing
             from datetime import datetime
 
             try:
@@ -132,6 +141,7 @@ class CronTool(Tool):
         else:
             return "Error: either every_seconds, cron_expr, or at is required"
 
+        # Register the job with the cron service, delivering results to the current chat
         job = self._cron.add_job(
             name=message[:30],
             schedule=schedule,
@@ -144,6 +154,7 @@ class CronTool(Tool):
         return f"Created job '{job.name}' (id: {job.id})"
 
     def _list_jobs(self) -> str:
+        """Return a formatted list of all scheduled jobs."""
         jobs = self._cron.list_jobs()
         if not jobs:
             return "No scheduled jobs."
@@ -151,6 +162,7 @@ class CronTool(Tool):
         return "Scheduled jobs:\n" + "\n".join(lines)
 
     def _remove_job(self, job_id: str | None) -> str:
+        """Remove a job by ID, returning success or not-found."""
         if not job_id:
             return "Error: job_id is required for remove"
         if self._cron.remove_job(job_id):

@@ -15,7 +15,9 @@ class GroqTranscriptionProvider:
     """
 
     def __init__(self, api_key: str | None = None):
+        # Fall back to env var if no key provided directly
         self.api_key = api_key or os.environ.get("GROQ_API_KEY")
+        # Groq exposes an OpenAI-compatible transcription endpoint
         self.api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
 
     async def transcribe(self, file_path: str | Path) -> str:
@@ -40,6 +42,8 @@ class GroqTranscriptionProvider:
         try:
             async with httpx.AsyncClient() as client:
                 with open(path, "rb") as f:
+                    # Multipart form upload: audio file + model selection
+                    # whisper-large-v3 is Groq's fastest and most accurate Whisper variant
                     files = {
                         "file": (path.name, f),
                         "model": (None, "whisper-large-v3"),
@@ -52,11 +56,12 @@ class GroqTranscriptionProvider:
                         self.api_url,
                         headers=headers,
                         files=files,
-                        timeout=60.0
+                        timeout=60.0  # Transcription can take a while for long audio
                     )
 
                     response.raise_for_status()
                     data = response.json()
+                    # Groq returns {"text": "transcribed content"} in OpenAI format
                     return data.get("text", "")
 
         except Exception as e:

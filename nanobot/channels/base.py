@@ -61,9 +61,12 @@ class BaseChannel(ABC):
     def is_allowed(self, sender_id: str) -> bool:
         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
         allow_list = getattr(self.config, "allow_from", [])
+        # Deny-by-default: empty allow_from means nobody can use this channel
+        # (this forces operators to explicitly configure access)
         if not allow_list:
             logger.warning("{}: allow_from is empty — all access denied", self.name)
             return False
+        # Wildcard: skip per-user checks
         if "*" in allow_list:
             return True
         return str(sender_id) in allow_list
@@ -90,6 +93,7 @@ class BaseChannel(ABC):
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
         """
+        # Gate: reject unauthorized senders before the message enters the bus
         if not self.is_allowed(sender_id):
             logger.warning(
                 "Access denied for sender {} on channel {}. "
@@ -98,6 +102,7 @@ class BaseChannel(ABC):
             )
             return
 
+        # Wrap raw platform data into a channel-agnostic InboundMessage and publish to the bus
         msg = InboundMessage(
             channel=self.name,
             sender_id=str(sender_id),

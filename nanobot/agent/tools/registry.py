@@ -13,6 +13,7 @@ class ToolRegistry:
     """
 
     def __init__(self):
+        # Tool storage keyed by name for O(1) lookup
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
@@ -37,21 +38,24 @@ class ToolRegistry:
 
     async def execute(self, name: str, params: dict[str, Any]) -> str:
         """Execute a tool by name with given parameters."""
+        # Hint appended to errors so the LLM is nudged to self-correct
         _HINT = "\n\n[Analyze the error above and try a different approach.]"
 
         tool = self._tools.get(name)
         if not tool:
+            # List available tools to help the agent recover from a hallucinated tool name
             return f"Error: Tool '{name}' not found. Available: {', '.join(self.tool_names)}"
 
         try:
             # Attempt to cast parameters to match schema types
             params = tool.cast_params(params)
             
-            # Validate parameters
+            # Validate parameters against the tool's JSON schema before execution
             errors = tool.validate_params(params)
             if errors:
                 return f"Error: Invalid parameters for tool '{name}': " + "; ".join(errors) + _HINT
             result = await tool.execute(**params)
+            # Append self-correction hint to tool errors so the agent retries
             if isinstance(result, str) and result.startswith("Error"):
                 return result + _HINT
             return result

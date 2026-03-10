@@ -6,7 +6,7 @@ import re
 import shutil
 from pathlib import Path
 
-# Default builtin skills directory (relative to this file)
+# Default builtin skills directory (ships with the nanobot package)
 BUILTIN_SKILLS_DIR = Path(__file__).parent.parent / "skills"
 
 
@@ -20,6 +20,7 @@ class SkillsLoader:
 
     def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
         self.workspace = workspace
+        # Workspace skills override builtins of the same name (user customization)
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
 
@@ -35,7 +36,7 @@ class SkillsLoader:
         """
         skills = []
 
-        # Workspace skills (highest priority)
+        # Workspace skills take highest priority — they shadow builtins with the same name
         if self.workspace_skills.exists():
             for skill_dir in self.workspace_skills.iterdir():
                 if skill_dir.is_dir():
@@ -43,7 +44,7 @@ class SkillsLoader:
                     if skill_file.exists():
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
 
-        # Built-in skills
+        # Built-in skills are only added if no workspace skill of the same name exists
         if self.builtin_skills and self.builtin_skills.exists():
             for skill_dir in self.builtin_skills.iterdir():
                 if skill_dir.is_dir():
@@ -51,7 +52,7 @@ class SkillsLoader:
                     if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
 
-        # Filter by requirements
+        # Exclude skills whose required binaries or env vars are missing
         if filter_unavailable:
             return [s for s in skills if self._check_requirements(self._get_skill_meta(s["name"]))]
         return skills
@@ -66,12 +67,12 @@ class SkillsLoader:
         Returns:
             Skill content or None if not found.
         """
-        # Check workspace first
+        # Check workspace first — allows user overrides of builtin skills
         workspace_skill = self.workspace_skills / name / "SKILL.md"
         if workspace_skill.exists():
             return workspace_skill.read_text(encoding="utf-8")
 
-        # Check built-in
+        # Fall back to built-in skills shipped with nanobot
         if self.builtin_skills:
             builtin_skill = self.builtin_skills / name / "SKILL.md"
             if builtin_skill.exists():
@@ -108,6 +109,8 @@ class SkillsLoader:
         Returns:
             XML-formatted skills summary.
         """
+        # Include all skills (even unavailable ones) so the agent knows what
+        # exists and can suggest installing missing dependencies
         all_skills = self.list_skills(filter_unavailable=False)
         if not all_skills:
             return ""
@@ -115,6 +118,7 @@ class SkillsLoader:
         def escape_xml(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+        # Emit XML format so the agent can reliably parse skill metadata
         lines = ["<skills>"]
         for s in all_skills:
             name = escape_xml(s["name"])
@@ -128,7 +132,8 @@ class SkillsLoader:
             lines.append(f"    <description>{desc}</description>")
             lines.append(f"    <location>{path}</location>")
 
-            # Show missing requirements for unavailable skills
+            # Show missing requirements for unavailable skills so the agent
+            # can suggest how to install them
             if not available:
                 missing = self._get_missing_requirements(skill_meta)
                 if missing:
@@ -143,9 +148,11 @@ class SkillsLoader:
         """Get a description of missing requirements."""
         missing = []
         requires = skill_meta.get("requires", {})
+        # Check for required CLI binaries on $PATH
         for b in requires.get("bins", []):
             if not shutil.which(b):
                 missing.append(f"CLI: {b}")
+        # Check for required environment variables
         for env in requires.get("env", []):
             if not os.environ.get(env):
                 missing.append(f"ENV: {env}")
@@ -170,12 +177,16 @@ class SkillsLoader:
         """Parse skill metadata JSON from frontmatter (supports nanobot and openclaw keys)."""
         try:
             data = json.loads(raw)
+            # Support both "nanobot" and legacy "openclaw" metadata keys
             return data.get("nanobot", data.get("openclaw", {})) if isinstance(data, dict) else {}
         except (json.JSONDecodeError, TypeError):
             return {}
 
     def _check_requirements(self, skill_meta: dict) -> bool:
-        """Check if skill requirements are met (bins, env vars)."""
+        """Check if skill requirements are met (bins, env vars).
+
+        Returns False as soon as any required binary or env var is missing.
+        """
         requires = skill_meta.get("requires", {})
         for b in requires.get("bins", []):
             if not shutil.which(b):
@@ -191,11 +202,16 @@ class SkillsLoader:
         return self._parse_nanobot_metadata(meta.get("metadata", ""))
 
     def get_always_skills(self) -> list[str]:
-        """Get skills marked as always=true that meet requirements."""
+        """Get skills marked as always=true that meet requirements.
+
+        These skills are injected in full into every system prompt, unlike
+        normal skills which are only loaded on demand via read_file.
+        """
         result = []
         for s in self.list_skills(filter_unavailable=True):
             meta = self.get_skill_metadata(s["name"]) or {}
             skill_meta = self._parse_nanobot_metadata(meta.get("metadata", ""))
+            # Support "always" in both the nanobot metadata block and top-level frontmatter
             if skill_meta.get("always") or meta.get("always"):
                 result.append(s["name"])
         return result
@@ -217,7 +233,8 @@ class SkillsLoader:
         if content.startswith("---"):
             match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
             if match:
-                # Simple YAML parsing
+                # Lightweight YAML parsing (avoids PyYAML dependency) — handles
+                # simple key: value pairs, which is all skill frontmatter needs
                 metadata = {}
                 for line in match.group(1).split("\n"):
                     if ":" in line:

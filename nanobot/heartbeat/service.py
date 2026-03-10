@@ -11,6 +11,9 @@ from loguru import logger
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
+# Virtual tool definition used in Phase 1 (decision).
+# Instead of parsing free-text LLM output, we force structured output via a tool call.
+# The LLM must call heartbeat(action="skip"|"run", tasks="...") — no ambiguous text parsing.
 _HEARTBEAT_TOOL = [
     {
         "type": "function",
@@ -61,10 +64,10 @@ class HeartbeatService:
         enabled: bool = True,
     ):
         self.workspace = workspace
-        self.provider = provider
+        self.provider = provider  # Used only for Phase 1 (lightweight decision call)
         self.model = model
-        self.on_execute = on_execute
-        self.on_notify = on_notify
+        self.on_execute = on_execute  # Phase 2 callback: runs tasks through full agent loop
+        self.on_notify = on_notify  # Delivers Phase 2 results to the user's channel
         self.interval_s = interval_s
         self.enabled = enabled
         self._running = False
@@ -87,6 +90,8 @@ class HeartbeatService:
 
         Returns (action, tasks) where action is 'skip' or 'run'.
         """
+        # Lightweight LLM call with only the heartbeat tool available.
+        # This is cheaper than a full agent turn — no tools, no history, just a decision.
         response = await self.provider.chat(
             messages=[
                 {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
@@ -99,9 +104,11 @@ class HeartbeatService:
             model=self.model,
         )
 
+        # If the LLM didn't call the tool (unexpected), default to skip
         if not response.has_tool_calls:
             return "skip", ""
 
+        # Extract structured decision from the tool call arguments
         args = response.tool_calls[0].arguments
         return args.get("action", "skip"), args.get("tasks", "")
 
@@ -129,6 +136,7 @@ class HeartbeatService:
         """Main heartbeat loop."""
         while self._running:
             try:
+                # Sleep first, then tick — so the first heartbeat fires after one interval
                 await asyncio.sleep(self.interval_s)
                 if self._running:
                     await self._tick()
@@ -138,7 +146,13 @@ class HeartbeatService:
                 logger.error("Heartbeat error: {}", e)
 
     async def _tick(self) -> None:
-        """Execute a single heartbeat tick."""
+        """Execute a single heartbeat tick.
+
+        Two-phase design:
+        Phase 1 (_decide): cheap LLM call to check if HEARTBEAT.md has active tasks.
+        Phase 2 (on_execute): full agent turn only if Phase 1 returns "run".
+        This avoids expensive agent turns when there's nothing to do.
+        """
         content = self._read_heartbeat_file()
         if not content:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
@@ -147,15 +161,18 @@ class HeartbeatService:
         logger.info("Heartbeat: checking for tasks...")
 
         try:
+            # Phase 1: lightweight decision
             action, tasks = await self._decide(content)
 
             if action != "run":
                 logger.info("Heartbeat: OK (nothing to report)")
                 return
 
+            # Phase 2: execute tasks through the full agent loop
             logger.info("Heartbeat: tasks found, executing...")
             if self.on_execute:
                 response = await self.on_execute(tasks)
+                # Deliver the response to the user if there's an active channel
                 if response and self.on_notify:
                     logger.info("Heartbeat: completed, delivering response")
                     await self.on_notify(response)
@@ -163,10 +180,11 @@ class HeartbeatService:
             logger.exception("Heartbeat execution failed")
 
     async def trigger_now(self) -> str | None:
-        """Manually trigger a heartbeat."""
+        """Manually trigger a heartbeat (bypasses the interval timer)."""
         content = self._read_heartbeat_file()
         if not content:
             return None
+        # Same two-phase flow as _tick, but called on-demand (e.g. from a tool)
         action, tasks = await self._decide(content)
         if action != "run" or not self.on_execute:
             return None

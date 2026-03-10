@@ -25,11 +25,13 @@ class Session:
     but does NOT modify the messages list or get_history() output.
     """
 
-    key: str  # channel:chat_id
-    messages: list[dict[str, Any]] = field(default_factory=list)
+    key: str  # channel:chat_id — uniquely identifies the conversation
+    messages: list[dict[str, Any]] = field(default_factory=list)  # Append-only message log
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Tracks how many messages have been summarized into MEMORY.md/HISTORY.md.
+    # get_history() only returns messages after this index to avoid redundant context.
     last_consolidated: int = 0  # Number of messages already consolidated to files
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
@@ -45,18 +47,22 @@ class Session:
 
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
         """Return unconsolidated messages for LLM input, aligned to a user turn."""
+        # Only include messages not yet consolidated (summarized to memory files)
         unconsolidated = self.messages[self.last_consolidated:]
         sliced = unconsolidated[-max_messages:]
 
         # Drop leading non-user messages to avoid orphaned tool_result blocks
+        # that would confuse the LLM (tool results without a preceding user message)
         for i, m in enumerate(sliced):
             if m.get("role") == "user":
                 sliced = sliced[i:]
                 break
 
+        # Build clean message dicts with only the fields the LLM API expects
         out: list[dict[str, Any]] = []
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
+            # Preserve tool-call metadata if present (needed for multi-turn tool use)
             for k in ("tool_calls", "tool_call_id", "name"):
                 if k in m:
                     entry[k] = m[k]
@@ -81,6 +87,7 @@ class SessionManager:
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
         self.legacy_sessions_dir = get_legacy_sessions_dir()
+        # In-memory cache avoids re-reading JSONL files on every access
         self._cache: dict[str, Session] = {}
 
     def _get_session_path(self, key: str) -> Path:
@@ -117,6 +124,8 @@ class SessionManager:
         """Load a session from disk."""
         path = self._get_session_path(key)
         if not path.exists():
+            # Transparent migration: move sessions from the old global directory
+            # (~/.nanobot/sessions/) to the per-workspace sessions directory
             legacy_path = self._get_legacy_session_path(key)
             if legacy_path.exists():
                 try:
@@ -134,6 +143,8 @@ class SessionManager:
             created_at = None
             last_consolidated = 0
 
+            # JSONL format: first line is metadata (prefixed with _type: "metadata"),
+            # all subsequent lines are individual conversation messages.
             with open(path, encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -142,6 +153,7 @@ class SessionManager:
 
                     data = json.loads(line)
 
+                    # The metadata line stores session-level info (timestamps, consolidation state)
                     if data.get("_type") == "metadata":
                         metadata = data.get("metadata", {})
                         created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else None
@@ -164,6 +176,7 @@ class SessionManager:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
 
+        # Full rewrite: metadata line first, then all messages as JSONL
         with open(path, "w", encoding="utf-8") as f:
             metadata_line = {
                 "_type": "metadata",
@@ -194,7 +207,7 @@ class SessionManager:
 
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
-                # Read just the metadata line
+                # Efficient: only read the first line (metadata) to get session info
                 with open(path, encoding="utf-8") as f:
                     first_line = f.readline().strip()
                     if first_line:
@@ -210,4 +223,5 @@ class SessionManager:
             except Exception:
                 continue
 
+        # Most recently updated sessions first — used by heartbeat target selection
         return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)

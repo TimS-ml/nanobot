@@ -1,3 +1,6 @@
+# Tests for the interactive CLI input layer: prompt session initialization,
+# async user input reading, and EOF-to-KeyboardInterrupt conversion.
+
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 

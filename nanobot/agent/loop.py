@@ -44,6 +44,7 @@ class AgentLoop:
     5. Sends responses back
     """
 
+    # Cap tool result size stored in session to avoid context bloat
     _TOOL_RESULT_MAX_CHARS = 500
 
     def __init__(
@@ -75,6 +76,8 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # memory_window controls how many recent messages are sent to the LLM,
+        # and triggers consolidation when exceeded
         self.memory_window = memory_window
         self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
@@ -105,15 +108,19 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
+        # Track which sessions have consolidation in flight to avoid double-consolidation
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
+        # WeakValueDictionary: locks are auto-cleaned when no longer referenced
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        # Global lock ensures only one message is processed at a time
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
+        # When restricted, only allow file operations within the workspace directory
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
@@ -125,23 +132,28 @@ class AgentLoop:
         ))
         self.tools.register(WebSearchTool(api_key=self.brave_api_key, proxy=self.web_proxy))
         self.tools.register(WebFetchTool(proxy=self.web_proxy))
+        # MessageTool wires directly to the outbound bus for sending responses
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        # CronTool is optional — only registered if a cron service is configured
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
+        # Guard: skip if already connected, currently connecting, or no servers configured
         if self._mcp_connected or self._mcp_connecting or not self._mcp_servers:
             return
         self._mcp_connecting = True
         from nanobot.agent.tools.mcp import connect_mcp_servers
         try:
+            # Use AsyncExitStack to manage MCP server lifetimes collectively
             self._mcp_stack = AsyncExitStack()
             await self._mcp_stack.__aenter__()
             await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
             self._mcp_connected = True
         except Exception as e:
+            # Non-fatal: MCP connection will be retried on next message
             logger.error("Failed to connect MCP servers (will retry next message): {}", e)
             if self._mcp_stack:
                 try:
@@ -154,6 +166,8 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
+        # Tools like message, spawn, and cron need to know which channel/chat
+        # to target when they produce output or schedule follow-ups
         for name in ("message", "spawn", "cron"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
@@ -188,6 +202,8 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
 
+        # Core loop: call LLM, execute any tool calls, repeat until LLM
+        # produces a final text response or we hit the iteration limit
         while iteration < self.max_iterations:
             iteration += 1
 
@@ -201,12 +217,14 @@ class AgentLoop:
             )
 
             if response.has_tool_calls:
+                # Stream intermediate thoughts and tool hints to the user as progress
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
                         await on_progress(thought)
                     await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
 
+                # Serialize tool calls into the message format the provider expects
                 tool_call_dicts = [
                     {
                         "id": tc.id,
@@ -224,6 +242,7 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
+                # Execute each tool call sequentially and append results
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
@@ -233,6 +252,7 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
+                # No tool calls — this is the final text response from the LLM
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
@@ -247,6 +267,7 @@ class AgentLoop:
                 final_content = clean
                 break
 
+        # Safety net: if the LLM kept requesting tools and never produced a final answer
         if final_content is None and iteration >= self.max_iterations:
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             final_content = (
@@ -262,28 +283,35 @@ class AgentLoop:
         await self._connect_mcp()
         logger.info("Agent loop started")
 
+        # Main event loop: pull messages from the inbound bus with a 1s poll
         while self._running:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
+            # /stop is handled immediately (not dispatched) so it can cancel in-flight work
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
             else:
+                # Dispatch as a separate task so the loop stays responsive to /stop
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
+                # Auto-remove task from tracking when it completes
                 task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
+        # Cancel main processing tasks for this session
         tasks = self._active_tasks.pop(msg.session_key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+        # Wait for cancelled tasks to finish their cleanup
         for t in tasks:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+        # Also cancel any background subagents tied to this session
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
@@ -293,12 +321,14 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
+        # Serialize message processing so sessions don't interleave
         async with self._processing_lock:
             try:
                 response = await self._process_message(msg)
                 if response is not None:
                     await self.bus.publish_outbound(response)
                 elif msg.channel == "cli":
+                    # CLI always expects a response, even if empty (for prompt UX)
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
                         content="", metadata=msg.metadata or {},
@@ -334,7 +364,8 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
-        # System messages: parse origin from chat_id ("channel:chat_id")
+        # System messages (e.g. subagent results) encode the original channel
+        # in the chat_id as "channel:chat_id" so we can route the response back
         if msg.channel == "system":
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
                                 else ("cli", msg.chat_id))
@@ -359,15 +390,18 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
-        # Slash commands
+        # Slash commands — handled before the normal LLM flow
         cmd = msg.content.strip().lower()
         if cmd == "/new":
+            # Archive all unconsolidated messages to memory before clearing the session,
+            # so no context is lost when starting fresh
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
             self._consolidating.add(session.key)
             try:
                 async with lock:
                     snapshot = session.messages[session.last_consolidated:]
                     if snapshot:
+                        # Use a temp session to avoid mutating the real one if archival fails
                         temp = Session(key=session.key)
                         temp.messages = list(snapshot)
                         if not await self._consolidate_memory(temp, archive_all=True):
@@ -384,6 +418,7 @@ class AgentLoop:
             finally:
                 self._consolidating.discard(session.key)
 
+            # Clear session and invalidate cache so next message starts fresh
             session.clear()
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
@@ -393,6 +428,8 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
 
+        # Trigger background memory consolidation when unconsolidated messages
+        # exceed the window — runs async so it doesn't block the current response
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
             self._consolidating.add(session.key)
@@ -408,14 +445,18 @@ class AgentLoop:
                     if _task is not None:
                         self._consolidation_tasks.discard(_task)
 
+            # Fire-and-forget; strong ref kept in _consolidation_tasks to prevent GC
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
+        # Inject routing context so tools know where to send their output
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        # Reset per-turn tracking so we know if the LLM used the message tool directly
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        # Build full prompt: system prompt + history window + current user message
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = self.context.build_messages(
             history=history,
@@ -424,6 +465,7 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
         )
 
+        # Progress callback sends intermediate thoughts/tool hints to the user
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
@@ -439,9 +481,12 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        # Persist this turn's messages to the session for future history
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
 
+        # If the LLM already sent a response via the message tool, suppress the
+        # automatic reply to avoid duplicate messages to the user
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
@@ -455,14 +500,20 @@ class AgentLoop:
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
+        # Skip messages that were already in the session (system + history),
+        # only persist the new messages from this turn
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
+            # Drop empty assistant messages — they poison session context on reload
             if role == "assistant" and not content and not entry.get("tool_calls"):
                 continue  # skip empty assistant messages — they poison session context
+            # Truncate large tool results to keep session storage manageable
             if role == "tool" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
                 entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
             elif role == "user":
+                # Runtime context (time, channel) is ephemeral — strip it before
+                # persisting so it doesn't accumulate in session history
                 if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
                     # Strip the runtime-context prefix, keep only the user text.
                     parts = content.split("\n\n", 1)
@@ -471,6 +522,8 @@ class AgentLoop:
                     else:
                         continue
                 if isinstance(content, list):
+                    # For multimodal messages, strip runtime context blocks
+                    # and replace inline base64 images with placeholders
                     filtered = []
                     for c in content:
                         if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):

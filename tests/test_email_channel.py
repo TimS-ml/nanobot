@@ -1,3 +1,6 @@
+# Tests for the email channel: IMAP fetch/mark-seen, SMTP reply threading,
+# auto-reply control, consent gating, and date-range message fetching.
+
 from email.message import EmailMessage
 from datetime import date
 
@@ -9,6 +12,7 @@ from nanobot.channels.email import EmailChannel
 from nanobot.config.schema import EmailConfig
 
 
+# Helper to create a default EmailConfig with test credentials
 def _make_config() -> EmailConfig:
     return EmailConfig(
         enabled=True,
@@ -25,6 +29,7 @@ def _make_config() -> EmailConfig:
     )
 
 
+# Helper to construct a raw RFC 2822 email message as bytes for IMAP simulation
 def _make_raw_email(
     from_addr: str = "alice@example.com",
     subject: str = "Hello",
@@ -39,6 +44,7 @@ def _make_raw_email(
     return msg.as_bytes()
 
 
+# Verify IMAP fetch parses email fields, marks as seen, and deduplicates by UID
 def test_fetch_new_messages_parses_unseen_and_marks_seen(monkeypatch) -> None:
     raw = _make_raw_email(subject="Invoice", body="Please pay")
 
@@ -82,6 +88,7 @@ def test_fetch_new_messages_parses_unseen_and_marks_seen(monkeypatch) -> None:
     assert items_again == []
 
 
+# Verify HTML-only emails fall back to extracting text from HTML body
 def test_extract_text_body_falls_back_to_html() -> None:
     msg = EmailMessage()
     msg["From"] = "alice@example.com"
@@ -94,6 +101,7 @@ def test_extract_text_body_falls_back_to_html() -> None:
     assert "world" in text
 
 
+# Verify start() is a no-op when consent_granted is False (no IMAP polling)
 @pytest.mark.asyncio
 async def test_start_returns_immediately_without_consent(monkeypatch) -> None:
     cfg = _make_config()
@@ -112,6 +120,7 @@ async def test_start_returns_immediately_without_consent(monkeypatch) -> None:
     assert called["fetch"] is False
 
 
+# Verify SMTP send adds "Re:" subject prefix and In-Reply-To header for replies
 @pytest.mark.asyncio
 async def test_send_uses_smtp_and_reply_subject(monkeypatch) -> None:
     class FakeSMTP:
@@ -279,6 +288,7 @@ async def test_send_proactive_email_when_auto_reply_disabled(monkeypatch) -> Non
     assert sent["To"] == "bob@example.com"
 
 
+# Verify send() is blocked entirely when consent_granted is False
 @pytest.mark.asyncio
 async def test_send_skips_when_consent_not_granted(monkeypatch) -> None:
     class FakeSMTP:
@@ -322,6 +332,7 @@ async def test_send_skips_when_consent_not_granted(monkeypatch) -> None:
     assert called["smtp"] is False
 
 
+# Verify date-range fetch uses IMAP SINCE/BEFORE and does NOT mark messages as seen
 def test_fetch_messages_between_dates_uses_imap_since_before_without_mark_seen(monkeypatch) -> None:
     raw = _make_raw_email(subject="Status", body="Yesterday update")
 

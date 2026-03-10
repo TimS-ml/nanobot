@@ -13,6 +13,7 @@ class SpawnTool(Tool):
 
     def __init__(self, manager: "SubagentManager"):
         self._manager = manager
+        # Default origin context — subagent results are delivered back to this channel/chat
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
         self._session_key = "cli:direct"
@@ -21,6 +22,7 @@ class SpawnTool(Tool):
         """Set the origin context for subagent announcements."""
         self._origin_channel = channel
         self._origin_chat_id = chat_id
+        # Session key ties the subagent's lifecycle to the parent conversation
         self._session_key = f"{channel}:{chat_id}"
 
     @property
@@ -54,6 +56,7 @@ class SpawnTool(Tool):
 
     async def execute(self, task: str, label: str | None = None, **kwargs: Any) -> str:
         """Spawn a subagent to execute the given task."""
+        # Delegate to SubagentManager which creates an independent agent loop in the background
         return await self._manager.spawn(
             task=task,
             label=label,

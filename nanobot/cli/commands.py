@@ -46,7 +46,9 @@ EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
 
+# Lazily initialized; shared across the entire interactive session
 _PROMPT_SESSION: PromptSession | None = None
+# Captured at startup to restore terminal state after prompt_toolkit's raw mode changes
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
 
 
@@ -59,6 +61,7 @@ def _flush_pending_tty_input() -> None:
     except Exception:
         return
 
+    # Prefer termios flush (instant kernel-level discard) when available
     try:
         import termios
         termios.tcflush(fd, termios.TCIFLUSH)
@@ -66,6 +69,7 @@ def _flush_pending_tty_input() -> None:
     except Exception:
         pass
 
+    # Fallback: drain stdin using non-blocking select (for platforms without termios)
     try:
         while True:
             ready, _, _ = select.select([fd], [], [], 0)
@@ -104,6 +108,7 @@ def _init_prompt_session() -> None:
     history_file = get_cli_history_path()
     history_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Single-line mode: Enter submits. Multiline paste is handled via bracketed paste mode.
     _PROMPT_SESSION = PromptSession(
         history=FileHistory(str(history_file)),
         enable_open_in_editor=False,
@@ -217,10 +222,13 @@ def _make_provider(config: Config):
     from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
 
     model = config.agents.defaults.model
+    # Resolve which provider to use based on model name / explicit config
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
 
-    # OpenAI Codex (OAuth)
+    # Special-case providers that bypass LiteLLM and use their own client implementations
+
+    # OpenAI Codex (OAuth) — uses device-flow auth, no API key needed
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
         return OpenAICodexProvider(default_model=model)
 
@@ -247,9 +255,11 @@ def _make_provider(config: Config):
             default_model=model,
         )
 
+    # Default path: LiteLLM handles routing to all other providers
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.providers.registry import find_by_name
     spec = find_by_name(provider_name)
+    # Bedrock uses IAM auth (no api_key); OAuth providers also skip the key check
     if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
         console.print("Set one in ~/.nanobot/config.json under providers section")
@@ -312,12 +322,14 @@ def gateway(
     config = _load_runtime_config(config, workspace)
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
+    # Ensure workspace has SYSTEM.md, MEMORY.md and other template files
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
+    # Cron persists jobs to a JSON file so timers survive restarts
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
 
@@ -342,7 +354,8 @@ def gateway(
         channels_config=config.channels,
     )
 
-    # Set cron callback (needs agent)
+    # Wire up the cron callback now that the agent exists.
+    # This closure lets cron jobs trigger agent turns with the scheduled instruction.
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
         from nanobot.agent.tools.cron import CronTool
@@ -353,7 +366,8 @@ def gateway(
             f"Scheduled instruction: {job.payload.message}"
         )
 
-        # Prevent the agent from scheduling new cron jobs during execution
+        # Guard: prevent the agent from scheduling new cron jobs while executing one
+        # (avoids infinite self-scheduling loops)
         cron_tool = agent.tools.get("cron")
         cron_token = None
         if isinstance(cron_tool, CronTool):
@@ -369,10 +383,13 @@ def gateway(
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
+        # If the agent already sent a message during the turn (via MessageTool),
+        # skip duplicate delivery — the user already received the response.
         message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
 
+        # Otherwise, deliver the response to the target channel/chat if configured
         if job.payload.deliver and job.payload.to and response:
             from nanobot.bus.events import OutboundMessage
             await bus.publish_outbound(OutboundMessage(
@@ -389,12 +406,14 @@ def gateway(
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
         enabled = set(channels.enabled_channels)
+        # Scan sessions sorted by most recently updated to find the best delivery target.
         # Prefer the most recently updated non-internal session on an enabled channel.
         for item in session_manager.list_sessions():
             key = item.get("key") or ""
             if ":" not in key:
                 continue
             channel, chat_id = key.split(":", 1)
+            # Skip internal-only sessions that can't route messages to users
             if channel in {"cli", "system"}:
                 continue
             if channel in enabled and chat_id:
@@ -402,11 +421,14 @@ def gateway(
         # Fallback keeps prior behavior but remains explicit.
         return "cli", "direct"
 
-    # Create heartbeat service
+    # Create heartbeat service — two callbacks:
+    #   on_execute: runs the heartbeat tasks through the agent loop (Phase 2)
+    #   on_notify: delivers the result to the user's channel
     async def on_heartbeat_execute(tasks: str) -> str:
         """Phase 2: execute heartbeat tasks through the full agent loop."""
         channel, chat_id = _pick_heartbeat_target()
 
+        # Suppress progress output for background heartbeat execution
         async def _silent(*_args, **_kwargs):
             pass
 
@@ -450,15 +472,17 @@ def gateway(
 
     async def run():
         try:
+            # Start background services first, then run agent + channels concurrently
             await cron.start()
             await heartbeat.start()
             await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
+                agent.run(),       # Consumes inbound bus messages
+                channels.start_all(),  # Connects to chat platforms + dispatches outbound
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
+            # Graceful teardown in reverse dependency order
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
@@ -543,7 +567,7 @@ def agent(
         console.print(f"  [dim]↳ {content}[/dim]")
 
     if message:
-        # Single message mode — direct call, no bus needed
+        # Single-shot mode: process one message and exit (no bus loop needed)
         async def run_once():
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
@@ -552,16 +576,20 @@ def agent(
 
         asyncio.run(run_once())
     else:
-        # Interactive mode — route through bus like other channels
+        # Interactive REPL mode — messages flow through the bus just like channel messages,
+        # so the agent loop handles CLI input identically to Telegram/WhatsApp/etc.
         from nanobot.bus.events import InboundMessage
         _init_prompt_session()
         console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
 
+        # Parse session_id into channel:chat_id pair for bus routing
         if ":" in session_id:
             cli_channel, cli_chat_id = session_id.split(":", 1)
         else:
             cli_channel, cli_chat_id = "cli", session_id
 
+        # Install signal handlers to ensure clean terminal restoration on exit.
+        # Without this, termios raw mode could leave the terminal unusable.
         def _handle_signal(signum, frame):
             sig_name = signal.Signals(signum).name
             _restore_terminal()
@@ -579,15 +607,18 @@ def agent(
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
         async def run_interactive():
+            # Start the agent's bus-consuming loop in the background
             bus_task = asyncio.create_task(agent_loop.run())
+            # Synchronization: turn_done signals when the agent's response is ready
             turn_done = asyncio.Event()
-            turn_done.set()
+            turn_done.set()  # Initially set so the first prompt is shown immediately
             turn_response: list[str] = []
 
             async def _consume_outbound():
                 while True:
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+                        # Progress messages are streaming partial output (tool hints or text)
                         if msg.metadata.get("_progress"):
                             is_tool_hint = msg.metadata.get("_tool_hint", False)
                             ch = agent_loop.channels_config
@@ -598,10 +629,12 @@ def agent(
                             else:
                                 console.print(f"  [dim]↳ {msg.content}[/dim]")
                         elif not turn_done.is_set():
+                            # This is the final response for the current user turn
                             if msg.content:
                                 turn_response.append(msg.content)
                             turn_done.set()
                         elif msg.content:
+                            # Unsolicited message (e.g. from cron/heartbeat) outside a user turn
                             console.print()
                             _print_agent_response(msg.content, render_markdown=markdown)
                     except asyncio.TimeoutError:
@@ -625,9 +658,11 @@ def agent(
                             console.print("\nGoodbye!")
                             break
 
+                        # Prepare for a new turn: reset the response gate and buffer
                         turn_done.clear()
                         turn_response.clear()
 
+                        # Route user input through the bus so the agent loop processes it
                         await bus.publish_inbound(InboundMessage(
                             channel=cli_channel,
                             sender_id="user",
@@ -635,6 +670,7 @@ def agent(
                             content=user_input,
                         ))
 
+                        # Block until the agent publishes a response (or spinner shows)
                         with _thinking_ctx():
                             await turn_done.wait()
 
@@ -760,7 +796,12 @@ def channels_status():
 
 
 def _get_bridge_dir() -> Path:
-    """Get the bridge directory, setting it up if needed."""
+    """Get the bridge directory, setting it up if needed.
+
+    The WhatsApp bridge is a Node.js project that runs alongside nanobot.
+    This function copies the bridge source to a user-writable location,
+    runs npm install + build, and returns the ready-to-run directory.
+    """
     import shutil
     import subprocess
 
@@ -769,7 +810,7 @@ def _get_bridge_dir() -> Path:
 
     user_bridge = get_bridge_install_dir()
 
-    # Check if already built
+    # Check if already built — skip re-setup if dist artifact exists
     if (user_bridge / "dist" / "index.js").exists():
         return user_bridge
 
@@ -778,7 +819,7 @@ def _get_bridge_dir() -> Path:
         console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
         raise typer.Exit(1)
 
-    # Find source bridge: first check package data, then source dir
+    # Find source bridge: check both installed package data and dev repo paths
     pkg_bridge = Path(__file__).parent.parent / "bridge"  # nanobot/bridge (installed)
     src_bridge = Path(__file__).parent.parent.parent / "bridge"  # repo root/bridge (dev)
 
@@ -795,7 +836,7 @@ def _get_bridge_dir() -> Path:
 
     console.print(f"{__logo__} Setting up bridge...")
 
-    # Copy to user directory
+    # Copy source to user directory, excluding build artifacts for a clean install
     user_bridge.parent.mkdir(parents=True, exist_ok=True)
     if user_bridge.exists():
         shutil.rmtree(user_bridge)
@@ -896,10 +937,12 @@ provider_app = typer.Typer(help="Manage providers")
 app.add_typer(provider_app, name="provider")
 
 
+# Registry pattern: each OAuth provider registers its login handler via the decorator
 _LOGIN_HANDLERS: dict[str, callable] = {}
 
 
 def _register_login(name: str):
+    """Decorator that registers a provider-specific login function by registry name."""
     def decorator(fn):
         _LOGIN_HANDLERS[name] = fn
         return fn

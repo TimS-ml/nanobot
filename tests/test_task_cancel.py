@@ -1,4 +1,9 @@
-"""Tests for /stop task cancellation."""
+"""Tests for /stop task cancellation.
+
+Verifies that the /stop command cancels active agent tasks, the dispatch
+lock serializes concurrent messages, and subagent tasks can be cancelled
+by session key.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+# Helper to create an AgentLoop with mocked dependencies for isolated testing
 def _make_loop():
     """Create a minimal AgentLoop with mocked dependencies."""
     from nanobot.agent.loop import AgentLoop
@@ -28,6 +34,7 @@ def _make_loop():
 
 
 class TestHandleStop:
+    # Verify /stop sends "No active task" when nothing is running for the chat
     @pytest.mark.asyncio
     async def test_stop_no_active_task(self):
         from nanobot.bus.events import InboundMessage
@@ -38,6 +45,7 @@ class TestHandleStop:
         out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         assert "No active task" in out.content
 
+    # Verify /stop cancels a single active task and confirms cancellation
     @pytest.mark.asyncio
     async def test_stop_cancels_active_task(self):
         from nanobot.bus.events import InboundMessage
@@ -63,6 +71,7 @@ class TestHandleStop:
         out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         assert "stopped" in out.content.lower()
 
+    # Verify /stop cancels all active tasks for a chat and reports the count
     @pytest.mark.asyncio
     async def test_stop_cancels_multiple_tasks(self):
         from nanobot.bus.events import InboundMessage
@@ -90,6 +99,7 @@ class TestHandleStop:
 
 
 class TestDispatch:
+    # Verify _dispatch processes a message and publishes the result to the bus
     @pytest.mark.asyncio
     async def test_dispatch_processes_and_publishes(self):
         from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -103,6 +113,7 @@ class TestDispatch:
         out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
         assert out.content == "hi"
 
+    # Verify the per-session lock serializes concurrent message processing
     @pytest.mark.asyncio
     async def test_processing_lock_serializes(self):
         from nanobot.bus.events import InboundMessage, OutboundMessage
@@ -127,6 +138,7 @@ class TestDispatch:
 
 
 class TestSubagentCancellation:
+    # Verify cancel_by_session cancels all subagent tasks for a given session key
     @pytest.mark.asyncio
     async def test_cancel_by_session(self):
         from nanobot.agent.subagent import SubagentManager
@@ -155,6 +167,7 @@ class TestSubagentCancellation:
         assert count == 1
         assert cancelled.is_set()
 
+    # Verify cancel_by_session returns 0 when no tasks exist for the session
     @pytest.mark.asyncio
     async def test_cancel_by_session_no_tasks(self):
         from nanobot.agent.subagent import SubagentManager

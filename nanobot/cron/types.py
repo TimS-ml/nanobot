@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
+# Three schedule types: "at" = one-shot at a timestamp, "every" = repeating interval,
+# "cron" = standard cron expression (e.g. "0 9 * * *" for daily at 9am)
 @dataclass
 class CronSchedule:
     """Schedule definition for a cron job."""
@@ -21,12 +23,12 @@ class CronSchedule:
 @dataclass
 class CronPayload:
     """What to do when the job runs."""
-    kind: Literal["system_event", "agent_turn"] = "agent_turn"
-    message: str = ""
-    # Deliver response to channel
+    kind: Literal["system_event", "agent_turn"] = "agent_turn"  # agent_turn = run through full agent loop
+    message: str = ""  # The instruction/prompt to send to the agent
+    # Delivery target: when set, the agent's response is sent to the specified channel/chat
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
-    to: str | None = None  # e.g. phone number
+    to: str | None = None  # e.g. phone number or chat_id
 
 
 @dataclass
@@ -41,15 +43,15 @@ class CronJobState:
 @dataclass
 class CronJob:
     """A scheduled job."""
-    id: str
+    id: str  # Short UUID (8 chars) for human-friendly identification
     name: str
     enabled: bool = True
     schedule: CronSchedule = field(default_factory=lambda: CronSchedule(kind="every"))
     payload: CronPayload = field(default_factory=CronPayload)
-    state: CronJobState = field(default_factory=CronJobState)
+    state: CronJobState = field(default_factory=CronJobState)  # Mutable runtime state
     created_at_ms: int = 0
     updated_at_ms: int = 0
-    delete_after_run: bool = False
+    delete_after_run: bool = False  # If true, job is removed from store after execution (one-shot cleanup)
 
 
 @dataclass

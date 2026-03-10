@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     from nanobot.session.manager import Session
 
 
+# Virtual tool definition given to the consolidation LLM so it can return
+# structured memory output (history entry + updated long-term memory).
+# This is never registered as a real executable tool — the result is parsed directly.
 _SAVE_MEMORY_TOOL = [
     {
         "type": "function",
@@ -43,7 +46,12 @@ _SAVE_MEMORY_TOOL = [
 
 
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log).
+
+    MEMORY.md is a living document that the LLM rewrites on each consolidation,
+    keeping only currently-relevant facts. HISTORY.md is append-only and serves
+    as a searchable timeline of past interactions.
+    """
 
     def __init__(self, workspace: Path):
         self.memory_dir = ensure_dir(workspace / "memory")
@@ -51,18 +59,22 @@ class MemoryStore:
         self.history_file = self.memory_dir / "HISTORY.md"
 
     def read_long_term(self) -> str:
+        """Read the current long-term memory (MEMORY.md). Returns empty string if none."""
         if self.memory_file.exists():
             return self.memory_file.read_text(encoding="utf-8")
         return ""
 
     def write_long_term(self, content: str) -> None:
+        """Overwrite long-term memory with the latest LLM-consolidated content."""
         self.memory_file.write_text(content, encoding="utf-8")
 
     def append_history(self, entry: str) -> None:
+        """Append a timestamped summary entry to the history log (append-only)."""
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
     def get_memory_context(self) -> str:
+        """Format long-term memory for injection into the system prompt."""
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
@@ -80,20 +92,25 @@ class MemoryStore:
         Returns True on success (including no-op), False on failure.
         """
         if archive_all:
+            # /new command: archive everything before clearing the session
             old_messages = session.messages
             keep_count = 0
             logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
         else:
+            # Normal consolidation: keep the most recent half of the window in session,
+            # consolidate everything older into persistent memory
             keep_count = memory_window // 2
             if len(session.messages) <= keep_count:
                 return True
             if len(session.messages) - session.last_consolidated <= 0:
                 return True
+            # Only consolidate messages since the last consolidation up to the keep boundary
             old_messages = session.messages[session.last_consolidated:-keep_count]
             if not old_messages:
                 return True
             logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
 
+        # Flatten messages into a human-readable transcript for the consolidation LLM
         lines = []
         for m in old_messages:
             if not m.get("content"):
@@ -101,6 +118,7 @@ class MemoryStore:
             tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
             lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
 
+        # Provide both current memory and transcript so the LLM can merge new info
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
@@ -111,6 +129,8 @@ class MemoryStore:
 {chr(10).join(lines)}"""
 
         try:
+            # Ask a separate LLM call (not the main agent) to distill the
+            # transcript into a history entry and updated long-term memory
             response = await provider.chat(
                 messages=[
                     {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
@@ -124,6 +144,7 @@ class MemoryStore:
                 logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
                 return False
 
+            # Normalize tool call arguments across provider quirks
             args = response.tool_calls[0].arguments
             # Some providers return arguments as a JSON string instead of dict
             if isinstance(args, str):
@@ -139,6 +160,7 @@ class MemoryStore:
                 logger.warning("Memory consolidation: unexpected arguments type {}", type(args).__name__)
                 return False
 
+            # Write the two memory layers: append-only history log + overwritable long-term memory
             if entry := args.get("history_entry"):
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
@@ -146,9 +168,11 @@ class MemoryStore:
             if update := args.get("memory_update"):
                 if not isinstance(update, str):
                     update = json.dumps(update, ensure_ascii=False)
+                # Only write if content actually changed to avoid unnecessary disk writes
                 if update != current_memory:
                     self.write_long_term(update)
 
+            # Advance the consolidation watermark so these messages aren't re-processed
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
             return True

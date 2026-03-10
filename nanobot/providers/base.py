@@ -8,18 +8,18 @@ from typing import Any
 @dataclass
 class ToolCallRequest:
     """A tool call request from the LLM."""
-    id: str
-    name: str
-    arguments: dict[str, Any]
+    id: str  # Provider-specific or generated tool call identifier
+    name: str  # Name of the tool/function the LLM wants to invoke
+    arguments: dict[str, Any]  # Parsed arguments to pass to the tool
 
 
 @dataclass
 class LLMResponse:
     """Response from an LLM provider."""
-    content: str | None
+    content: str | None  # Text content of the response (may be None if only tool calls)
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
-    finish_reason: str = "stop"
-    usage: dict[str, int] = field(default_factory=dict)
+    finish_reason: str = "stop"  # "stop", "tool_calls", "length", or "error"
+    usage: dict[str, int] = field(default_factory=dict)  # Token usage stats
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
     
@@ -38,8 +38,8 @@ class LLMProvider(ABC):
     """
 
     def __init__(self, api_key: str | None = None, api_base: str | None = None):
-        self.api_key = api_key
-        self.api_base = api_base
+        self.api_key = api_key  # Authentication credential for the provider
+        self.api_base = api_base  # Custom API endpoint URL (overrides default)
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -52,12 +52,15 @@ class LLMProvider(ABC):
         for msg in messages:
             content = msg.get("content")
 
+            # Handle empty string content: assistant msgs with tool_calls get None
+            # (valid per OpenAI spec), other roles get "(empty)" placeholder
             if isinstance(content, str) and not content:
                 clean = dict(msg)
                 clean["content"] = None if (msg.get("role") == "assistant" and msg.get("tool_calls")) else "(empty)"
                 result.append(clean)
                 continue
 
+            # Handle list content: filter out empty text blocks that would cause 400s
             if isinstance(content, list):
                 filtered = [
                     item for item in content
@@ -72,12 +75,14 @@ class LLMProvider(ABC):
                     if filtered:
                         clean["content"] = filtered
                     elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+                        # Assistant with tool_calls can have null content
                         clean["content"] = None
                     else:
                         clean["content"] = "(empty)"
                     result.append(clean)
                     continue
 
+            # Wrap bare dict content in a list (some MCP tools return single dicts)
             if isinstance(content, dict):
                 clean = dict(msg)
                 clean["content"] = [content]
@@ -95,7 +100,9 @@ class LLMProvider(ABC):
         """Keep only provider-safe message keys and normalize assistant content."""
         sanitized = []
         for msg in messages:
+            # Strip unknown keys that would cause provider-specific validation errors
             clean = {k: v for k, v in msg.items() if k in allowed_keys}
+            # OpenAI spec requires assistant messages to always have a content field
             if clean.get("role") == "assistant" and "content" not in clean:
                 clean["content"] = None
             sanitized.append(clean)

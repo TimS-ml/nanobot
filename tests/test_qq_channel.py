@@ -1,3 +1,6 @@
+# Tests for the QQ channel: inbound group message routing and outbound
+# group message sending with msg_seq tracking.
+
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +11,7 @@ from nanobot.channels.qq import QQChannel
 from nanobot.config.schema import QQConfig
 
 
+# Fake QQ API that records C2C and group message calls
 class _FakeApi:
     def __init__(self) -> None:
         self.c2c_calls: list[dict] = []
@@ -25,6 +29,7 @@ class _FakeClient:
         self.api = _FakeApi()
 
 
+# Verify inbound group messages set sender_id and chat_id correctly from QQ data
 @pytest.mark.asyncio
 async def test_on_group_message_routes_to_group_chat_id() -> None:
     channel = QQChannel(QQConfig(app_id="app", secret="secret", allow_from=["user1"]), MessageBus())
@@ -43,6 +48,7 @@ async def test_on_group_message_routes_to_group_chat_id() -> None:
     assert msg.chat_id == "group123"
 
 
+# Verify outbound group messages use post_group_message API with auto-incrementing msg_seq
 @pytest.mark.asyncio
 async def test_send_group_message_uses_group_api_with_msg_seq() -> None:
     channel = QQChannel(QQConfig(app_id="app", secret="secret", allow_from=["*"]), MessageBus())

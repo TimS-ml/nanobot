@@ -1,4 +1,9 @@
-"""Test session management with cache-friendly message handling."""
+"""Test session management with cache-friendly message handling.
+
+Comprehensive tests for Session and SessionManager: last_consolidated offset
+tracking, message immutability, persistence round-trips, consolidation triggers,
+archive_all mode, slice logic, boundary conditions, and deduplication guards.
+"""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock

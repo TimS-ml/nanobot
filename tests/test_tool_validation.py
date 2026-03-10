@@ -1,3 +1,7 @@
+# Tests for tool parameter validation, type casting, and the exec tool path extraction.
+# Covers required fields, type checks, range/enum constraints, nested objects, and
+# the cast_params helper that coerces LLM-provided strings into correct Python types.
+
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
@@ -5,6 +9,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 
 
+# Sample tool with a rich JSON Schema used to exercise all validation paths
 class SampleTool(Tool):
     @property
     def name(self) -> str:
@@ -41,12 +46,14 @@ class SampleTool(Tool):
         return "ok"
 
 
+# Verify that omitting a required parameter produces a validation error
 def test_validate_params_missing_required() -> None:
     tool = SampleTool()
     errors = tool.validate_params({"query": "hi"})
     assert "missing required count" in "; ".join(errors)
 
 
+# Verify that wrong types and out-of-range values are caught
 def test_validate_params_type_and_range() -> None:
     tool = SampleTool()
     errors = tool.validate_params({"query": "hi", "count": 0})
@@ -56,6 +63,7 @@ def test_validate_params_type_and_range() -> None:
     assert any("count should be integer" in e for e in errors)
 
 
+# Verify that enum constraint violations and minLength violations are reported
 def test_validate_params_enum_and_min_length() -> None:
     tool = SampleTool()
     errors = tool.validate_params({"query": "h", "count": 2, "mode": "slow"})
@@ -63,6 +71,7 @@ def test_validate_params_enum_and_min_length() -> None:
     assert any("mode must be one of" in e for e in errors)
 
 
+# Verify validation recurses into nested objects and array items
 def test_validate_params_nested_object_and_array() -> None:
     tool = SampleTool()
     errors = tool.validate_params(
@@ -76,12 +85,14 @@ def test_validate_params_nested_object_and_array() -> None:
     assert any("meta.flags[0] should be string" in e for e in errors)
 
 
+# Verify that extra/unknown fields are silently ignored (no errors)
 def test_validate_params_ignores_unknown_fields() -> None:
     tool = SampleTool()
     errors = tool.validate_params({"query": "hi", "count": 2, "extra": "x"})
     assert errors == []
 
 
+# Verify the registry returns an error string instead of executing when params are invalid
 async def test_registry_returns_validation_error() -> None:
     reg = ToolRegistry()
     reg.register(SampleTool())
@@ -89,18 +100,21 @@ async def test_registry_returns_validation_error() -> None:
     assert "Invalid parameters" in result
 
 
+# Verify that Windows-style absolute paths (C:\...) are correctly extracted
 def test_exec_extract_absolute_paths_keeps_full_windows_path() -> None:
     cmd = r"type C:\user\workspace\txt"
     paths = ExecTool._extract_absolute_paths(cmd)
     assert paths == [r"C:\user\workspace\txt"]
 
 
+# Verify that relative paths like .venv/bin/python are not mistaken for absolute
 def test_exec_extract_absolute_paths_ignores_relative_posix_segments() -> None:
     cmd = ".venv/bin/python script.py"
     paths = ExecTool._extract_absolute_paths(cmd)
     assert "/bin/python" not in paths
 
 
+# Verify that POSIX absolute paths (/tmp/...) are correctly extracted from commands
 def test_exec_extract_absolute_paths_captures_posix_absolute_paths() -> None:
     cmd = "cat /tmp/data.txt > /tmp/out.txt"
     paths = ExecTool._extract_absolute_paths(cmd)
@@ -133,6 +147,7 @@ class CastTestTool(Tool):
         return "ok"
 
 
+# Verify that string "42" is cast to int 42 for integer-typed parameters
 def test_cast_params_string_to_int() -> None:
     tool = CastTestTool(
         {
@@ -145,6 +160,7 @@ def test_cast_params_string_to_int() -> None:
     assert isinstance(result["count"], int)
 
 
+# Verify that string "3.14" is cast to float 3.14 for number-typed parameters
 def test_cast_params_string_to_number() -> None:
     tool = CastTestTool(
         {
@@ -157,6 +173,7 @@ def test_cast_params_string_to_number() -> None:
     assert isinstance(result["rate"], float)
 
 
+# Verify that "true"/"false"/"1" strings are cast to Python booleans
 def test_cast_params_string_to_bool() -> None:
     tool = CastTestTool(
         {
@@ -169,6 +186,7 @@ def test_cast_params_string_to_bool() -> None:
     assert tool.cast_params({"enabled": "1"})["enabled"] is True
 
 
+# Verify that string items inside an array are cast to the declared item type
 def test_cast_params_array_items() -> None:
     tool = CastTestTool(
         {
@@ -182,6 +200,7 @@ def test_cast_params_array_items() -> None:
     assert result["nums"] == [1, 2, 3]
 
 
+# Verify that casting recurses into nested object properties
 def test_cast_params_nested_object() -> None:
     tool = CastTestTool(
         {
@@ -202,6 +221,7 @@ def test_cast_params_nested_object() -> None:
     assert result["config"]["debug"] is True
 
 
+# Verify that Python bool True is NOT silently cast to int (isinstance(True, int) is True in Python)
 def test_cast_params_bool_not_cast_to_int() -> None:
     """Booleans should not be silently cast to integers."""
     tool = CastTestTool(
@@ -216,6 +236,7 @@ def test_cast_params_bool_not_cast_to_int() -> None:
     assert any("count should be integer" in e for e in errors)
 
 
+# Verify that empty string "" is preserved as-is for string-typed parameters
 def test_cast_params_preserves_empty_string() -> None:
     """Empty strings should be preserved for string type."""
     tool = CastTestTool(
@@ -228,6 +249,7 @@ def test_cast_params_preserves_empty_string() -> None:
     assert result["name"] == ""
 
 
+# Verify that various falsy string representations are cast to False
 def test_cast_params_bool_string_false() -> None:
     """Test that 'false', '0', 'no' strings convert to False."""
     tool = CastTestTool(
@@ -243,6 +265,7 @@ def test_cast_params_bool_string_false() -> None:
     assert tool.cast_params({"flag": "NO"})["flag"] is False
 
 
+# Verify that unrecognized strings like "random" are left as-is (validation catches them)
 def test_cast_params_bool_string_invalid() -> None:
     """Invalid boolean strings should not be cast."""
     tool = CastTestTool(
@@ -258,6 +281,7 @@ def test_cast_params_bool_string_invalid() -> None:
     assert result["flag"] == "maybe"
 
 
+# Verify that non-numeric strings like "abc" are preserved when cast to integer fails
 def test_cast_params_invalid_string_to_int() -> None:
     """Invalid strings should not be cast to integer."""
     tool = CastTestTool(
@@ -272,6 +296,7 @@ def test_cast_params_invalid_string_to_int() -> None:
     assert result["count"] == "12.5.7"
 
 
+# Verify that non-numeric strings are preserved when cast to number fails
 def test_cast_params_invalid_string_to_number() -> None:
     """Invalid strings should not be cast to number."""
     tool = CastTestTool(
@@ -284,6 +309,7 @@ def test_cast_params_invalid_string_to_number() -> None:
     assert result["rate"] == "not_a_number"
 
 
+# Verify that Python booleans are rejected for number-typed parameters
 def test_validate_params_bool_not_accepted_as_number() -> None:
     """Booleans should not pass number validation."""
     tool = CastTestTool(
@@ -296,6 +322,7 @@ def test_validate_params_bool_not_accepted_as_number() -> None:
     assert any("rate should be number" in e for e in errors)
 
 
+# Verify that None values are preserved across all parameter types
 def test_cast_params_none_values() -> None:
     """Test None handling for different types."""
     tool = CastTestTool(
@@ -324,6 +351,7 @@ def test_cast_params_none_values() -> None:
     assert result["config"] is None
 
 
+# Verify that scalar values are NOT auto-wrapped into arrays (validation catches type mismatch)
 def test_cast_params_single_value_not_auto_wrapped_to_array() -> None:
     """Single values should NOT be automatically wrapped into arrays."""
     tool = CastTestTool(

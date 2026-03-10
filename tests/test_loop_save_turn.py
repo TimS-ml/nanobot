@@ -1,14 +1,19 @@
+# Tests for AgentLoop._save_turn to verify that runtime-only context messages are
+# stripped from session history, and that image placeholders are preserved.
+
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
 from nanobot.session.manager import Session
 
 
+# Create a minimal AgentLoop without full initialization for unit testing _save_turn
 def _mk_loop() -> AgentLoop:
     loop = AgentLoop.__new__(AgentLoop)
     loop._TOOL_RESULT_MAX_CHARS = 500
     return loop
 
 
+# Verify that a multimodal user message containing only runtime context is dropped entirely
 def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:
     loop = _mk_loop()
     session = Session(key="test:runtime-only")
@@ -22,6 +27,7 @@ def test_save_turn_skips_multimodal_user_when_only_runtime_context() -> None:
     assert session.messages == []
 
 
+# Verify that when runtime context is stripped, image_url parts become [image] placeholders
 def test_save_turn_keeps_image_placeholder_after_runtime_strip() -> None:
     loop = _mk_loop()
     session = Session(key="test:image")
